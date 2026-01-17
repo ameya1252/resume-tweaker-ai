@@ -1,0 +1,177 @@
+:root{
+  font-family: "Space Grotesk", "IBM Plex Sans", "Segoe UI", Arial, sans-serif;
+  color-scheme: dark;
+  --bg: #07080b;
+  --panel: #0d0f14;
+  --panel-2: #11131a;
+  --stroke: #222634;
+  --muted: #9aa3b2;
+  --text: #eef1f7;
+  --accent: #d7ff7a;
+  --accent-2: #5ee7df;
+  --error: #2a0f14;
+  --error-stroke: #5a1a30;
+}
+*{box-sizing:border-box;}
+body{
+  margin:0;
+  background: radial-gradient(1200px 600px at 20% -10%, #11162a 0%, #07080b 60%) fixed;
+  color: var(--text);
+}
+a{color:inherit;}
+textarea, input, button{font-family:inherit;}
+.page{min-height:100vh; position:relative; overflow:hidden;}
+.glow{
+  position:absolute;
+  width:700px;
+  height:700px;
+  right:-200px;
+  top:-300px;
+  background: radial-gradient(circle, rgba(215,255,122,0.18), rgba(94,231,223,0.08), transparent 70%);
+  filter: blur(2px);
+  pointer-events:none;
+}
+.container{max-width:1100px; margin:0 auto; padding:28px 20px 40px; position:relative;}
+.hero{padding:10px 0 22px;}
+.eyebrow{
+  text-transform: uppercase;
+  letter-spacing: 0.2em;
+  font-size: 11px;
+  color: var(--muted);
+  margin-bottom: 8px;
+}
+.h1{font-size:34px; font-weight:600; letter-spacing:-0.02em; margin:0 0 10px;}
+.h2{font-size:18px; font-weight:600; margin:0;}
+.p{opacity:.9; margin:0 0 14px; line-height:1.5; max-width:700px;}
+.label{font-size:12px; color:var(--muted); margin:0 0 8px;}
+.panel{
+  background: linear-gradient(180deg, var(--panel), var(--panel-2));
+  border:1px solid var(--stroke);
+  border-radius:18px;
+  padding:16px;
+  box-shadow: 0 10px 30px rgba(0,0,0,.35);
+}
+.grid{display:grid; gap:16px;}
+@media(min-width:960px){.grid-2{grid-template-columns: 1.1fr 0.9fr;}}
+.ta{
+  width:100%;
+  min-height:240px;
+  background:#0a0c12;
+  border:1px solid #1f2330;
+  border-radius:14px;
+  padding:12px;
+  color:var(--text);
+  outline:none;
+  transition:border-color .2s ease, box-shadow .2s ease;
+}
+.ta:focus{border-color:#2a3246; box-shadow: 0 0 0 2px rgba(215,255,122,.08);}
+.input{
+  width:100%;
+  background:#0a0c12;
+  border:1px solid #1f2330;
+  border-radius:14px;
+  padding:10px;
+  color:var(--text);
+  outline:none;
+}
+.mode-toggle{
+  display:flex;
+  gap:8px;
+  flex-wrap:wrap;
+}
+.chip{
+  background:#0f1219;
+  border:1px solid #232838;
+  color:var(--muted);
+  padding:7px 12px;
+  border-radius:999px;
+  font-size:12px;
+  cursor:pointer;
+  transition:border-color .2s ease, color .2s ease, transform .15s ease;
+}
+.chip:hover{transform:translateY(-1px); border-color:#2b3145;}
+.chip.active{
+  color:var(--text);
+  border-color:#2a3246;
+  background: linear-gradient(120deg, #10131b, #0b0d12);
+}
+.gdocs-actions{
+  display:flex;
+  gap:10px;
+  margin:12px 0 10px;
+  flex-wrap:wrap;
+}
+.actions{
+  display:flex;
+  gap:10px;
+  align-items:center;
+  flex-wrap:wrap;
+  margin-top:14px;
+}
+.btn{
+  background:#12151c;
+  border:1px solid #232838;
+  color:var(--text);
+  padding:10px 14px;
+  border-radius:12px;
+  font-weight:600;
+  cursor:pointer;
+  transition:transform .15s ease, border-color .2s ease, background .2s ease;
+}
+.btn:hover{transform:translateY(-1px); border-color:#2b3145;}
+.btn:disabled{opacity:.5; cursor:not-allowed; transform:none;}
+.btn.primary{
+  background: linear-gradient(120deg, #1b1f2b, #0d0f14);
+  border-color:#2a3246;
+  color: var(--accent);
+}
+.badge{
+  font-size:11px;
+  padding:4px 10px;
+  border-radius:999px;
+  background:#11141c;
+  border:1px solid #232838;
+  opacity:.9;
+}
+.badge.ok{
+  color:#0b1210;
+  background: linear-gradient(120deg, var(--accent), var(--accent-2));
+  border-color:#1f4a46;
+}
+.status-row{
+  display:flex;
+  gap:10px;
+  align-items:center;
+  flex-wrap:wrap;
+  margin-top:12px;
+}
+.small{font-size:12px; opacity:.85;}
+.subtle{color:var(--muted);}
+.error{
+  margin-top:12px;
+  padding:12px;
+  border-radius:12px;
+  background: var(--error);
+  border: 1px solid var(--error-stroke);
+}
+.preview-panel{margin-top:16px;}
+.preview-head{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:10px;
+  margin-bottom:10px;
+}
+.cover-panel{margin-top:16px;}
+.ta-cover{
+  min-height:180px;
+  margin-top:12px;
+}
+.preview{
+  background:#ffffff;
+  color:#111827;
+  border-radius:12px;
+  padding:18px;
+  overflow:auto;
+  max-height:70vh;
+}
