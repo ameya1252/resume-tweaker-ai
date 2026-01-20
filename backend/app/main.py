@@ -1,3 +1,4 @@
+import contextvars
 import json
 import logging
 import os
@@ -47,6 +48,10 @@ _google_state: Optional[str] = None
 _google_creds_data: Optional[Dict[str, str]] = None
 _latex_template: Optional[str] = None
 _last_compiled_latex: Optional[str] = None
+_request_cache: contextvars.ContextVar[Optional[Dict[str, object]]] = contextvars.ContextVar(
+    "request_cache",
+    default=None,
+)
 
 
 def _is_placeholder(value: str) -> bool:
@@ -117,6 +122,13 @@ class OptimizeResult(BaseModel):
 
 class CoverLetterResult(BaseModel):
     cover_letter: str
+
+
+class RoleFrame(BaseModel):
+    experience_id: str
+    original_title: str
+    updated_title: str = Field(max_length=80)
+    role_summary: str = Field(max_length=200)
 
 
 COVER_LETTER_INSTRUCTIONS = (
@@ -282,6 +294,80 @@ def _parse_latex_resume_items(latex_text: str, keyword_hint: List[str]) -> Tuple
     return slots, ranges
 
 
+def _parse_latex_resume_subheadings(latex_text: str) -> Tuple[List[Dict[str, object]], List[Tuple[int, int]]]:
+    """
+    Deterministically parse \\resumeSubheading{...}{...}{...}{...} blocks using brace depth tracking.
+    Returns subheading dicts and (start, end) indices for the title content only.
+    """
+    subheadings: List[Dict[str, object]] = []
+    ranges: List[Tuple[int, int]] = []
+    idx = 0
+    needle = "\\resumeSubheading"
+    while idx < len(latex_text):
+        start = latex_text.find(needle, idx)
+        if start == -1:
+            break
+        i = start + len(needle)
+        while i < len(latex_text) and latex_text[i].isspace():
+            i += 1
+        if i >= len(latex_text) or latex_text[i] != "{":
+            idx = i
+            continue
+
+        fields: List[str] = []
+        field_ranges: List[Tuple[int, int]] = []
+        parse_failed = False
+        for _ in range(4):
+            if i >= len(latex_text) or latex_text[i] != "{":
+                parse_failed = True
+                break
+            content_start = i + 1
+            depth = 1
+            j = content_start
+            while j < len(latex_text) and depth > 0:
+                ch = latex_text[j]
+                if ch == "{" and latex_text[j - 1] != "\\":
+                    depth += 1
+                elif ch == "}" and latex_text[j - 1] != "\\":
+                    depth -= 1
+                j += 1
+            if depth != 0:
+                parse_failed = True
+                break
+            content_end = j - 1
+            fields.append(latex_text[content_start:content_end].strip())
+            field_ranges.append((content_start, content_end))
+            i = j
+            while i < len(latex_text) and latex_text[i].isspace():
+                i += 1
+
+        if not parse_failed and len(fields) == 4:
+            title_start, title_end = field_ranges[2]
+            subheadings.append(
+                {
+                    "id": f"lhs{len(subheadings)}",
+                    "company": fields[0],
+                    "location": fields[1],
+                    "title": fields[2],
+                    "dates": fields[3],
+                    "title_range": [title_start, title_end],
+                }
+            )
+            ranges.append((title_start, title_end))
+
+        idx = i if i > start else start + len(needle)
+
+        if parse_failed and i == start + len(needle):
+            break
+
+    if not subheadings:
+        raise HTTPException(
+            status_code=400,
+            detail="No \\resumeSubheading{...} entries found in this LaTeX template.",
+        )
+    return subheadings, ranges
+
+
 def _parse_latex_skills_section(latex_text: str) -> Optional[Tuple[int, int, str]]:
     """
     Extract the technical skills section content inside the first \\item{...} within its itemize block.
@@ -396,6 +482,39 @@ def _apply_replacements(text: str, replacements: List[Tuple[int, int, str]]) -> 
     for start, end, repl in sorted(replacements, key=lambda x: x[0], reverse=True):
         out = out[:start] + repl + out[end:]
     return out
+
+
+def _format_title_replacement(original_raw: str, updated_title: str) -> str:
+    """
+    Preserve outer LaTeX formatting (e.g., \\textit{...}) when replacing a title.
+    """
+    leading = len(original_raw) - len(original_raw.lstrip())
+    trailing = len(original_raw) - len(original_raw.rstrip())
+    core = original_raw.strip()
+    escaped_title = _escape_latex(updated_title.strip())
+
+    if core.startswith("\\"):
+        i = 1
+        while i < len(core) and core[i].isalpha():
+            i += 1
+        cmd = core[:i]
+        j = i
+        while j < len(core) and core[j].isspace():
+            j += 1
+        if j < len(core) and core[j] == "{":
+            depth = 1
+            k = j + 1
+            while k < len(core) and depth > 0:
+                ch = core[k]
+                if ch == "{" and core[k - 1] != "\\":
+                    depth += 1
+                elif ch == "}" and core[k - 1] != "\\":
+                    depth -= 1
+                k += 1
+            if depth == 0 and core[k:].strip() == "":
+                return (" " * leading) + cmd + "{" + escaped_title + "}" + (" " * trailing)
+
+    return (" " * leading) + escaped_title + (" " * trailing)
 
 
 def _extract_keywords_from_jd(job_description: str) -> List[str]:
@@ -646,7 +765,12 @@ def _call_openai_greeting(job_description: str) -> str:
     return greeting.strip()
 
 
-def _call_openai(job_description: str, slots: List[Slot]) -> List[OptimizeResult]:
+def _call_openai(
+    job_description: str,
+    slots: List[Slot],
+    role_context: Optional[Dict[str, str]] = None,
+    risk_level: str = "balanced",
+) -> List[OptimizeResult]:
     if client is None:
         raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set in backend/.env")
 
@@ -666,12 +790,17 @@ def _call_openai(job_description: str, slots: List[Slot]) -> List[OptimizeResult
         "9) Preserve the essence of each experience (e.g., lab/retail/marketplace/supply chain context).\n"
         "10) You MAY change job titles as needed to improve alignment.\n"
         "11) Preserve ATS-safe formatting; avoid special characters or new LaTeX commands.\n"
+        "12) Bullets must align with the provided role title and role summary.\n"
+        "13) Apply the requested risk_level to keyword density and reframing; do NOT change seniority.\n"
     )
 
     payload = {
         "job_description": job_description,
         "resume_slots": [s.model_dump() for s in slots],
+        "risk_level": risk_level,
     }
+    if role_context:
+        payload.update(role_context)
 
     # Use Chat Completions API for broad compatibility with installed SDK versions.
     resp = client.chat.completions.create(
@@ -722,6 +851,222 @@ def _call_openai(job_description: str, slots: List[Slot]) -> List[OptimizeResult
         results.append(OptimizeResult(id=s.id, updated_text=upd))
 
     return results
+
+
+def _call_openai_role_frame(
+    job_description: str,
+    job_analysis: Dict[str, object],
+    company: str,
+    original_title: str,
+    existing_bullets: List[str],
+    risk_level: str,
+) -> Dict[str, str]:
+    if client is None:
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set in backend/.env")
+
+    instructions = (
+        "You create a role frame for a resume experience.\n"
+        "Return JSON ONLY: {\"updated_title\":\"...\",\"role_summary\":\"...\"}\n"
+        "Rules (STRICT):\n"
+        "1) Do NOT inflate seniority; keep level realistic for the role.\n"
+        "2) Preserve the truth of the role.\n"
+        "3) Optimize title for ATS + recruiter clarity.\n"
+        "4) Use job archetype keywords when relevant.\n"
+        "5) updated_title must remain realistic (no \"Senior\" if intern).\n"
+        "6) role_summary describes scope, not achievements.\n"
+        "7) role_summary must be <= 200 characters.\n"
+        "8) Apply the requested risk_level to title changes and reframing; do NOT change seniority.\n"
+    )
+    payload = {
+        "job_description": job_description,
+        "job_analysis": job_analysis,
+        "company": company,
+        "original_title": original_title,
+        "existing_bullets": existing_bullets,
+        "risk_level": risk_level,
+    }
+
+    resp = client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=[
+            {"role": "system", "content": instructions},
+            {"role": "user", "content": json.dumps(payload)},
+        ],
+        response_format={"type": "json_object"},
+        temperature=0.2,
+    )
+
+    text = (resp.choices[0].message.content or "").strip()
+    if not text:
+        raise HTTPException(status_code=500, detail="OpenAI returned empty output.")
+    try:
+        data = json.loads(text)
+    except Exception:
+        m = re.search(r"\{.*\}", text, re.DOTALL)
+        if not m:
+            raise HTTPException(status_code=500, detail=f"Could not parse OpenAI JSON output. Raw: {text[:400]}")
+        data = json.loads(m.group(0))
+
+    updated_title = data.get("updated_title")
+    role_summary = data.get("role_summary")
+
+    if not isinstance(role_summary, str) or not role_summary.strip():
+        raise HTTPException(status_code=500, detail="OpenAI returned invalid role_summary.")
+    role_summary = role_summary.strip()
+    if len(role_summary) > 200:
+        raise HTTPException(status_code=500, detail="OpenAI returned role_summary over 200 characters.")
+
+    updated_title_valid = isinstance(updated_title, str) and updated_title.strip()
+    if updated_title_valid:
+        updated_title = updated_title.strip()
+        if len(updated_title) > 80:
+            updated_title_valid = False
+        else:
+            seniority = str(job_analysis.get("seniority", "")).strip().lower()
+            lowered = updated_title.lower()
+            if seniority in {"intern", "entry"} and any(
+                kw in lowered for kw in ["senior", "lead", "principal", "staff", "manager", "director", "vp", "head"]
+            ):
+                updated_title_valid = False
+
+    if not updated_title_valid:
+        updated_title = original_title.strip()
+
+    return {
+        "updated_title": updated_title,
+        "role_summary": role_summary,
+    }
+
+
+def _call_openai_audit(
+    updated_title: str,
+    rewritten_bullets: List[str],
+    skills_section: str,
+) -> Dict[str, List[str]]:
+    if client is None:
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set in backend/.env")
+
+    instructions = (
+        "You audit resume content for risks and gaps.\n"
+        "Return JSON ONLY: {\"warnings\":[...],\"suggestions\":[...]}\n"
+        "Rules (STRICT):\n"
+        "1) No rewriting of bullets or skills.\n"
+        "2) No creativity beyond analysis of the provided text.\n"
+        "3) Warnings only if high confidence.\n"
+        "4) Suggestions must be actionable and specific (e.g., \"Add fraud signal to CampusX\").\n"
+        "5) Keep lists concise.\n"
+    )
+    payload = {
+        "updated_title": updated_title,
+        "rewritten_bullets": rewritten_bullets,
+        "skills_section": skills_section,
+    }
+
+    resp = client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=[
+            {"role": "system", "content": instructions},
+            {"role": "user", "content": json.dumps(payload)},
+        ],
+        response_format={"type": "json_object"},
+        temperature=0.0,
+    )
+
+    text = (resp.choices[0].message.content or "").strip()
+    if not text:
+        raise HTTPException(status_code=500, detail="OpenAI returned empty output.")
+    try:
+        data = json.loads(text)
+    except Exception:
+        m = re.search(r"\{.*\}", text, re.DOTALL)
+        if not m:
+            raise HTTPException(status_code=500, detail=f"Could not parse OpenAI JSON output. Raw: {text[:400]}")
+        data = json.loads(m.group(0))
+
+    warnings = data.get("warnings")
+    suggestions = data.get("suggestions")
+
+    if not isinstance(warnings, list) or not all(isinstance(x, str) for x in warnings):
+        raise HTTPException(status_code=500, detail="OpenAI returned invalid warnings list.")
+    if not isinstance(suggestions, list) or not all(isinstance(x, str) for x in suggestions):
+        raise HTTPException(status_code=500, detail="OpenAI returned invalid suggestions list.")
+
+    return {
+        "warnings": [w.strip() for w in warnings if w.strip()],
+        "suggestions": [s.strip() for s in suggestions if s.strip()],
+    }
+
+
+def _analyze_job_description(job_description: str) -> Dict[str, object]:
+    if client is None:
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set in backend/.env")
+
+    cache = _request_cache.get()
+    if cache is None:
+        cache = {}
+        _request_cache.set(cache)
+    cache_key = f"job_analysis:{job_description}"
+    cached = cache.get(cache_key)
+    if isinstance(cached, dict):
+        return cached
+
+    instructions = (
+        "You analyze a job description and return a compact hiring-signal frame.\n"
+        "Return JSON ONLY with keys:\n"
+        "role_archetype (string), seniority (\"intern\"|\"entry\"|\"mid\"|\"senior\"),\n"
+        "primary_axes (string[]), must_signal (string[]), nice_to_signal (string[]).\n"
+        "No extra keys. No markdown. No commentary."
+    )
+    payload = {"job_description": job_description}
+    resp = client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=[
+            {"role": "system", "content": instructions},
+            {"role": "user", "content": json.dumps(payload)},
+        ],
+        response_format={"type": "json_object"},
+        temperature=0.0,
+    )
+    text = (resp.choices[0].message.content or "").strip()
+    if not text:
+        raise HTTPException(status_code=500, detail="OpenAI returned empty output.")
+    try:
+        data = json.loads(text)
+    except Exception:
+        m = re.search(r"\{.*\}", text, re.DOTALL)
+        if not m:
+            raise HTTPException(status_code=500, detail=f"Could not parse OpenAI JSON output. Raw: {text[:400]}")
+        data = json.loads(m.group(0))
+
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=500, detail="OpenAI returned invalid analysis output.")
+
+    role_archetype = data.get("role_archetype")
+    seniority = data.get("seniority")
+    primary_axes = data.get("primary_axes")
+    must_signal = data.get("must_signal")
+    nice_to_signal = data.get("nice_to_signal")
+
+    if not isinstance(role_archetype, str) or not role_archetype.strip():
+        raise HTTPException(status_code=500, detail="OpenAI returned invalid role_archetype.")
+    if seniority not in {"intern", "entry", "mid", "senior"}:
+        raise HTTPException(status_code=500, detail="OpenAI returned invalid seniority.")
+    if not isinstance(primary_axes, list) or not all(isinstance(x, str) for x in primary_axes):
+        raise HTTPException(status_code=500, detail="OpenAI returned invalid primary_axes.")
+    if not isinstance(must_signal, list) or not all(isinstance(x, str) for x in must_signal):
+        raise HTTPException(status_code=500, detail="OpenAI returned invalid must_signal.")
+    if not isinstance(nice_to_signal, list) or not all(isinstance(x, str) for x in nice_to_signal):
+        raise HTTPException(status_code=500, detail="OpenAI returned invalid nice_to_signal.")
+
+    result = {
+        "role_archetype": role_archetype.strip(),
+        "seniority": seniority,
+        "primary_axes": [x.strip() for x in primary_axes if x.strip()],
+        "must_signal": [x.strip() for x in must_signal if x.strip()],
+        "nice_to_signal": [x.strip() for x in nice_to_signal if x.strip()],
+    }
+    cache[cache_key] = result
+    return result
 
 
 def _extract_latex_text(latex_text: str) -> str:
@@ -932,50 +1277,109 @@ def coverletter_google_doc(payload: GoogleCoverLetterRequest):
 @app.post("/optimize")
 async def optimize(
     job_description: str = Form(...),
+    risk_level: str = Form("balanced"),
 ):
     if not _latex_template:
         raise HTTPException(status_code=400, detail="LaTeX template not set. Upload or paste a .tex template first.")
     _validate_latex_template(_latex_template)
 
-    keyword_hint = _extract_keywords_from_jd(job_description)
-    slots, ranges = _parse_latex_resume_items(_latex_template, keyword_hint)
-    results = _call_openai(job_description, slots)
-    slot_by_id = {s.id: s for s in slots}
-    res_by_id = {}
-    for r in results:
-        original = slot_by_id.get(r.id).text if r.id in slot_by_id else r.updated_text
-        sanitized = _sanitize_latex_bullet(r.updated_text)
-        res_by_id[r.id] = _escape_latex(sanitized if sanitized.strip() else original)
+    cache_token = _request_cache.set({})
+    try:
+        risk_level = risk_level.strip().lower()
+        if risk_level not in {"conservative", "balanced", "aggressive"}:
+            raise HTTPException(status_code=400, detail="risk_level must be conservative, balanced, or aggressive.")
 
-    replacements: List[Tuple[int, int, str]] = []
-    for slot, (start, end) in zip(slots, ranges):
-        new_text = res_by_id.get(slot.id, slot.text)
-        replacements.append((start, end, new_text))
+        job_analysis = _analyze_job_description(job_description)
+        subheadings, title_ranges = _parse_latex_resume_subheadings(_latex_template)
+        keyword_hint = _extract_keywords_from_jd(job_description)
+        slots, ranges = _parse_latex_resume_items(_latex_template, keyword_hint)
+        existing_bullets = [s.text for s in slots]
+        updated_title_meta: List[Dict[str, str]] = []
+        title_replacements: List[Tuple[int, int, str]] = []
 
-    skills = _parse_latex_skills_section(_latex_template)
-    skills_updated = False
-    if skills:
-        s_start, s_end, s_text = skills
-        updated_skills_raw = _call_openai_skills(job_description, s_text)
-        updated_skills = _escape_latex_text_keep_commands(_sanitize_latex_content(s_text, updated_skills_raw))
-        replacements.append((s_start, s_end, updated_skills))
-        skills_updated = True
+        for subheading, (t_start, t_end) in zip(subheadings, title_ranges):
+            original_title = str(subheading.get("title", ""))
+            company = str(subheading.get("company", ""))
+            role_frame = _call_openai_role_frame(
+                job_description=job_description,
+                job_analysis=job_analysis,
+                company=company,
+                original_title=original_title,
+                existing_bullets=existing_bullets,
+                risk_level=risk_level,
+            )
+            updated_title = role_frame.get("updated_title", original_title).strip()
+            original_raw = _latex_template[t_start:t_end]
+            replaced_title = _format_title_replacement(original_raw, updated_title)
+            updated_title_meta.append(
+                {
+                    "id": str(subheading.get("id", "")),
+                    "company": company,
+                    "original_title": original_title,
+                    "updated_title": updated_title,
+                    "role_summary": role_frame.get("role_summary", "").strip(),
+                }
+            )
+            title_replacements.append((t_start, t_end, replaced_title))
 
-    updated_latex = _apply_replacements(_latex_template, replacements)
-    global _last_compiled_latex
-    _last_compiled_latex = updated_latex
-    pdf_bytes = _compile_latex_to_pdf_bytes(updated_latex)
+        role_context: Optional[Dict[str, str]] = None
+        if updated_title_meta:
+            first = updated_title_meta[0]
+            role_context = {
+                "updated_title": first.get("updated_title", ""),
+                "role_summary": first.get("role_summary", ""),
+                "job_archetype": str(job_analysis.get("role_archetype", "")).strip(),
+            }
+        results = _call_openai(job_description, slots, role_context=role_context, risk_level=risk_level)
+        slot_by_id = {s.id: s for s in slots}
+        res_by_id = {}
+        for r in results:
+            original = slot_by_id.get(r.id).text if r.id in slot_by_id else r.updated_text
+            sanitized = _sanitize_latex_bullet(r.updated_text)
+            res_by_id[r.id] = _escape_latex(sanitized if sanitized.strip() else original)
 
-    import base64
-    payload = {
-        "tex_base64": base64.b64encode(updated_latex.encode("utf-8")).decode("utf-8"),
-        "pdf_base64": base64.b64encode(pdf_bytes).decode("utf-8"),
-        "pdf_available": True,
-        "bullets_edited": len(results),
-        "keyword_hints": keyword_hint,
-        "skills_updated": skills_updated,
-    }
-    return JSONResponse(payload)
+        replacements: List[Tuple[int, int, str]] = []
+        replacements.extend(title_replacements)
+        for slot, (start, end) in zip(slots, ranges):
+            new_text = res_by_id.get(slot.id, slot.text)
+            replacements.append((start, end, new_text))
+
+        skills = _parse_latex_skills_section(_latex_template)
+        skills_updated = False
+        audit_skills_text = ""
+        if skills:
+            s_start, s_end, s_text = skills
+            updated_skills_raw = _call_openai_skills(job_description, s_text)
+            updated_skills = _escape_latex_text_keep_commands(_sanitize_latex_content(s_text, updated_skills_raw))
+            replacements.append((s_start, s_end, updated_skills))
+            skills_updated = True
+            audit_skills_text = updated_skills
+        elif skills is None:
+            audit_skills_text = ""
+
+        audit_title = role_context.get("updated_title", "") if role_context else ""
+        rewritten_bullets = [res_by_id.get(s.id, s.text) for s in slots]
+        audit = _call_openai_audit(audit_title, rewritten_bullets, audit_skills_text)
+
+        updated_latex = _apply_replacements(_latex_template, replacements)
+        global _last_compiled_latex
+        _last_compiled_latex = updated_latex
+        pdf_bytes = _compile_latex_to_pdf_bytes(updated_latex)
+
+        import base64
+        payload = {
+            "tex_base64": base64.b64encode(updated_latex.encode("utf-8")).decode("utf-8"),
+            "pdf_base64": base64.b64encode(pdf_bytes).decode("utf-8"),
+            "pdf_available": True,
+            "bullets_edited": len(results),
+            "keyword_hints": keyword_hint,
+            "skills_updated": skills_updated,
+            "updated_titles": updated_title_meta,
+            "audit": audit,
+        }
+        return JSONResponse(payload)
+    finally:
+        _request_cache.reset(cache_token)
 
 
 @app.post("/coverletter")
