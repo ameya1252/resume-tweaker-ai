@@ -1,6 +1,5 @@
-import React, { useMemo, useState } from 'react'
+import React, { useEffect, useMemo, useState } from 'react'
 import axios from 'axios'
-import mammoth from 'mammoth'
 
 const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || 'http://localhost:8000'
 
@@ -28,8 +27,10 @@ function downloadBytes(bytes: Uint8Array, filename: string, mime: string) {
 
 export default function App() {
   const [jobDescription, setJobDescription] = useState('')
-  const [file, setFile] = useState<File | null>(null)
-  const [mode, setMode] = useState<'docx' | 'gdocs'>('docx')
+  const [latexFile, setLatexFile] = useState<File | null>(null)
+  const [latexText, setLatexText] = useState('')
+  const [hasTemplate, setHasTemplate] = useState(false)
+  const [mode, setMode] = useState<'latex' | 'gdocs'>('latex')
   const [googleDocs, setGoogleDocs] = useState<GoogleDoc[]>([])
   const [selectedDocId, setSelectedDocId] = useState('')
   const [coverDocId, setCoverDocId] = useState('')
@@ -39,33 +40,32 @@ export default function App() {
   const [coverLoading, setCoverLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
-  const [docxB64, setDocxB64] = useState<string | null>(null)
+  const [texB64, setTexB64] = useState<string | null>(null)
   const [pdfB64, setPdfB64] = useState<string | null>(null)
   const [pdfAvailable, setPdfAvailable] = useState(false)
   const [bulletsEdited, setBulletsEdited] = useState<number | null>(null)
   const [keywordHints, setKeywordHints] = useState<string[]>([])
-  const [previewHtml, setPreviewHtml] = useState<string>('')
   const [coverLetterText, setCoverLetterText] = useState<string>('')
+  const [pdfUrl, setPdfUrl] = useState<string>('')
 
   const canOptimize = useMemo(() => {
     if (mode === 'gdocs') {
       return jobDescription.trim().length > 40 && !!selectedDocId
     }
-    return jobDescription.trim().length > 40 && !!file
-  }, [jobDescription, file, mode, selectedDocId])
+    return jobDescription.trim().length > 40 && hasTemplate
+  }, [jobDescription, mode, selectedDocId, hasTemplate])
 
   const canGenerateCover = useMemo(() => {
     if (mode === 'gdocs') {
       return jobDescription.trim().length > 40 && !!selectedDocId && !!coverDocId
     }
-    return jobDescription.trim().length > 40 && !!file
-  }, [jobDescription, file, mode, selectedDocId, coverDocId])
+    return jobDescription.trim().length > 40 && hasTemplate
+  }, [jobDescription, mode, selectedDocId, coverDocId, hasTemplate])
 
   function resetOutputs() {
-    setDocxB64(null)
+    setTexB64(null)
     setPdfB64(null)
     setPdfAvailable(false)
-    setPreviewHtml('')
     setBulletsEdited(null)
     setKeywordHints([])
   }
@@ -75,13 +75,39 @@ export default function App() {
     setCoverLetterStatus(null)
   }
 
-  function handleModeChange(nextMode: 'docx' | 'gdocs') {
+  function handleModeChange(nextMode: 'latex' | 'gdocs') {
     setMode(nextMode)
     setError(null)
     setGdocsStatus(null)
     resetOutputs()
     resetCoverLetter()
   }
+
+  useEffect(() => {
+    let active = true
+    axios.get(`${BACKEND_URL}/latex/template`).then((res) => {
+      if (!active) return
+      setHasTemplate(!!res.data?.has_template)
+    }).catch(() => {
+      if (!active) return
+      setHasTemplate(false)
+    })
+    return () => {
+      active = false
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!pdfB64) {
+      setPdfUrl('')
+      return
+    }
+    const bytes = b64ToUint8Array(pdfB64)
+    const blob = new Blob([bytes], { type: 'application/pdf' })
+    const url = URL.createObjectURL(blob)
+    setPdfUrl(url)
+    return () => URL.revokeObjectURL(url)
+  }, [pdfB64])
 
   function openGoogleAuth() {
     window.open(`${BACKEND_URL}/auth/google`, '_blank', 'width=520,height=720')
@@ -123,30 +149,25 @@ export default function App() {
         setBulletsEdited(bullets_edited ?? null)
         setKeywordHints(Array.isArray(keyword_hints) ? keyword_hints : [])
         setGdocsStatus('Updated in Google Docs. Open your doc to review the changes.')
-        setPreviewHtml('<div style="opacity:.6">Preview not available for Google Docs.</div>')
+        setPdfUrl('')
         return
       }
 
       const form = new FormData()
       form.append('job_description', jobDescription)
-      form.append('resume', file!)
 
       const res = await axios.post(`${BACKEND_URL}/optimize`, form, {
         headers: { 'Content-Type': 'multipart/form-data' },
         timeout: 120000,
       })
 
-      const { docx_base64, pdf_base64, pdf_available, bullets_edited, keyword_hints } = res.data
-      setDocxB64(docx_base64)
+      const { tex_base64, pdf_base64, pdf_available, bullets_edited, keyword_hints } = res.data
+      setTexB64(tex_base64)
       setPdfB64(pdf_base64)
       setPdfAvailable(!!pdf_available)
       setBulletsEdited(bullets_edited ?? null)
       setKeywordHints(Array.isArray(keyword_hints) ? keyword_hints : [])
-
-      // Render preview (DOCX -> HTML) in browser
-      const bytes = b64ToUint8Array(docx_base64)
-      const result = await mammoth.convertToHtml({ arrayBuffer: bytes.buffer })
-      setPreviewHtml(result.value || '')
+      setPdfUrl('')
     } catch (e: any) {
       const msg =
         e?.response?.data?.detail ||
@@ -180,7 +201,6 @@ export default function App() {
 
       const form = new FormData()
       form.append('job_description', jobDescription)
-      form.append('resume', file!)
 
       const res = await axios.post(`${BACKEND_URL}/coverletter`, form, {
         headers: { 'Content-Type': 'multipart/form-data' },
@@ -200,10 +220,33 @@ export default function App() {
     }
   }
 
-  function handleDownloadDocx() {
-    if (!docxB64) return
-    const bytes = b64ToUint8Array(docxB64)
-    downloadBytes(bytes, 'resume_optimized.docx', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document')
+  async function handleSaveTemplate() {
+    setError(null)
+    try {
+      const form = new FormData()
+      if (latexFile) {
+        form.append('template', latexFile)
+      } else {
+        form.append('latex_text', latexText)
+      }
+      const res = await axios.post(`${BACKEND_URL}/latex/template`, form, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+      })
+      setHasTemplate(true)
+      setGdocsStatus(res.data?.message || 'Template saved.')
+    } catch (e: any) {
+      const msg =
+        e?.response?.data?.detail ||
+        e?.message ||
+        'Could not save LaTeX template.'
+      setError(String(msg))
+    }
+  }
+
+  function handleDownloadTex() {
+    if (!texB64) return
+    const bytes = b64ToUint8Array(texB64)
+    downloadBytes(bytes, 'resume_optimized.tex', 'application/x-tex')
   }
 
   function handleDownloadPdf() {
@@ -226,7 +269,7 @@ export default function App() {
           <div className="eyebrow">Resume Tweaker AI</div>
           <div className="h1">Tweak your resume to the job in minutes.</div>
           <p className="p">
-            Paste a job description, upload your DOCX, and get a tailored version that keeps the layout intact.
+            Paste a job description, upload your LaTeX template, and get a tailored version that keeps the layout intact.
           </p>
         </div>
 
@@ -247,23 +290,35 @@ export default function App() {
           <div className="panel">
             <div className="label">Resume source</div>
             <div className="mode-toggle">
-              <button className={`chip ${mode === 'docx' ? 'active' : ''}`} onClick={() => handleModeChange('docx')}>
-                Upload DOCX
+              <button className={`chip ${mode === 'latex' ? 'active' : ''}`} onClick={() => handleModeChange('latex')}>
+                LaTeX Template
               </button>
               <button className={`chip ${mode === 'gdocs' ? 'active' : ''}`} onClick={() => handleModeChange('gdocs')}>
                 Google Docs
               </button>
             </div>
 
-            {mode === 'docx' ? (
+            {mode === 'latex' ? (
               <>
-                <div className="label" style={{ marginTop: 10 }}>Base resume (DOCX)</div>
+                <div className="label" style={{ marginTop: 10 }}>Base resume template (.tex)</div>
                 <input
                   className="input"
                   type="file"
-                  accept=".docx"
-                  onChange={(e) => setFile(e.target.files?.[0] ?? null)}
+                  accept=".tex"
+                  onChange={(e) => setLatexFile(e.target.files?.[0] ?? null)}
                 />
+                <textarea
+                  className="ta"
+                  placeholder="Or paste your LaTeX template here..."
+                  value={latexText}
+                  onChange={(e) => setLatexText(e.target.value)}
+                />
+                <div className="actions">
+                  <button className="btn" onClick={handleSaveTemplate}>
+                    Save Template
+                  </button>
+                  {hasTemplate ? <span className="badge ok">Template saved</span> : <span className="badge">No template</span>}
+                </div>
               </>
             ) : (
               <>
@@ -293,10 +348,10 @@ export default function App() {
               <button className="btn primary" disabled={!canOptimize || loading} onClick={handleOptimize}>
                 {loading ? 'Optimizing…' : 'Optimize'}
               </button>
-              {mode === 'docx' && (
+              {mode === 'latex' && (
                 <>
-                  <button className="btn" disabled={!docxB64} onClick={handleDownloadDocx}>
-                    Download DOCX
+                  <button className="btn" disabled={!texB64} onClick={handleDownloadTex}>
+                    Download .tex
                   </button>
                   <button className="btn" disabled={!pdfB64} onClick={handleDownloadPdf}>
                     Download PDF
@@ -306,7 +361,7 @@ export default function App() {
             </div>
 
             <div className="status-row">
-              {mode === 'docx' ? (
+              {mode === 'latex' ? (
                 pdfAvailable ? <span className="badge ok">PDF ready</span> : <span className="badge">PDF optional</span>
               ) : (
                 <span className="badge">Google Docs</span>
@@ -323,9 +378,9 @@ export default function App() {
               )}
             </div>
 
-            {!pdfAvailable && docxB64 && mode === 'docx' && (
+            {!pdfAvailable && texB64 && mode === 'latex' && (
               <div className="small subtle">
-                PDF export needs LibreOffice (<code>soffice</code>) on your PATH. You can still download DOCX.
+                PDF export needs pdflatex available on your PATH.
               </div>
             )}
 
@@ -370,7 +425,7 @@ export default function App() {
             <button className="btn primary" disabled={!canGenerateCover || coverLoading} onClick={handleGenerateCoverLetter}>
               {coverLoading ? 'Generating…' : 'Generate Cover Letter'}
             </button>
-            {mode === 'docx' && (
+            {mode === 'latex' && (
               <button className="btn" disabled={!coverLetterText} onClick={handleDownloadCoverLetter}>
                 Download Cover Letter
               </button>
@@ -395,13 +450,18 @@ export default function App() {
           <div className="preview-head">
             <div className="h2">Preview</div>
             <div className="small subtle">
-              {mode === 'docx' ? 'DOCX → HTML preview (layout may vary slightly).' : 'Preview not available for Google Docs.'}
+              {mode === 'latex' ? 'PDF preview (compiled from LaTeX).' : 'Preview not available for Google Docs.'}
             </div>
           </div>
-          <div
-            className="preview"
-            dangerouslySetInnerHTML={{ __html: previewHtml || '<div style="opacity:.6">No preview yet.</div>' }}
-          />
+          {mode === 'latex' ? (
+            pdfUrl ? (
+              <iframe className="preview-frame" src={pdfUrl} title="Resume PDF preview" />
+            ) : (
+              <div className="preview">No preview yet.</div>
+            )
+          ) : (
+            <div className="preview">Preview not available for Google Docs.</div>
+          )}
         </div>
       </div>
     </div>

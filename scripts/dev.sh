@@ -8,12 +8,15 @@ FRONTEND_DIR="$ROOT_DIR/frontend"
 UVICORN_BIN="$BACKEND_DIR/.venv/bin/uvicorn"
 PYTHON_BIN="$BACKEND_DIR/.venv/bin/python"
 
+if [[ ! -x "$PYTHON_BIN" ]]; then
+  echo "Backend venv not found. Run: cd backend && python -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt" >&2
+  exit 1
+fi
+
 if [[ -x "$UVICORN_BIN" ]]; then
   BACKEND_CMD=("$UVICORN_BIN" "app.main:app" "--reload" "--port" "8000")
-elif [[ -x "$PYTHON_BIN" ]]; then
-  BACKEND_CMD=("$PYTHON_BIN" "-m" "uvicorn" "app.main:app" "--reload" "--port" "8000")
 else
-  BACKEND_CMD=("python" "-m" "uvicorn" "app.main:app" "--reload" "--port" "8000")
+  BACKEND_CMD=("$PYTHON_BIN" "-m" "uvicorn" "app.main:app" "--reload" "--port" "8000")
 fi
 
 cd "$BACKEND_DIR"

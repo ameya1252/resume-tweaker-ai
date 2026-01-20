@@ -1,9 +1,7 @@
-import io
 import json
 import logging
 import os
 import re
-import shutil
 import subprocess
 import tempfile
 from typing import Dict, List, Optional, Tuple
@@ -14,7 +12,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
 from openai import OpenAI
 from pydantic import BaseModel, Field
-from docx import Document
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
@@ -48,6 +45,8 @@ GOOGLE_SCOPES = [
 
 _google_state: Optional[str] = None
 _google_creds_data: Optional[Dict[str, str]] = None
+_latex_template: Optional[str] = None
+_last_compiled_latex: Optional[str] = None
 
 
 def _is_placeholder(value: str) -> bool:
@@ -104,7 +103,10 @@ app.add_middleware(
 class Slot(BaseModel):
     id: str
     text: str
-    max_chars: int = Field(ge=10, le=300)
+    original_text: Optional[str] = None
+    role_id: str
+    slot_type: str = "bullet"
+    max_chars: int = Field(ge=10, le=1200)
     keywords_required: List[str] = Field(default_factory=list)
 
 
@@ -155,6 +157,10 @@ class GoogleCoverLetterRequest(BaseModel):
     resume_doc_id: str
     cover_doc_id: str
     job_description: str
+
+
+class LatexTemplateRequest(BaseModel):
+    latex_text: str
 
 
 def _google_flow() -> Flow:
@@ -211,6 +217,9 @@ def _extract_google_doc_slots(doc: dict, keyword_hint: List[str]) -> Tuple[List[
         slot = Slot(
             id=f"g{len(slots)}",
             text=txt,
+            original_text=txt,
+            role_id=f"gdoc_role_{len(slots) // 10}",
+            slot_type="bullet",
             max_chars=max_chars,
             keywords_required=keyword_hint[:6],
         )
@@ -221,61 +230,172 @@ def _extract_google_doc_slots(doc: dict, keyword_hint: List[str]) -> Tuple[List[
         raise HTTPException(status_code=400, detail="No bullet paragraphs found in this Google Doc.")
 
     return slots, ranges
-def _is_bullet_paragraph(p) -> bool:
-    """
-    Best-effort heuristic: detect bullet-like paragraphs.
-    We look at paragraph style name + numbering properties.
-    """
-    style_name = (p.style.name or "").lower() if p.style else ""
-    if "list" in style_name or "bullet" in style_name:
-        return True
-    # Some templates use numbering for bullets
-    try:
-        if p._p.pPr is not None and p._p.pPr.numPr is not None:
-            return True
-    except Exception:
-        pass
-    # Fallback: common bullet characters in text
-    t = (p.text or "").strip()
-    return t.startswith(("•", "-", "–", "—"))
 
 
-def _extract_slots(doc: Document, keyword_hint: List[str]) -> Tuple[List[Slot], List[int]]:
+def _parse_latex_resume_items(latex_text: str, keyword_hint: List[str]) -> Tuple[List[Slot], List[Tuple[int, int]]]:
     """
-    Extract bullet paragraphs as editable slots.
-    Returns slots and the indices of paragraphs in doc.paragraphs corresponding to each slot.
+    Deterministically parse \\resumeItem{...} blocks using brace depth tracking.
+    Returns slots and (start, end) indices for the inner content only.
     """
     slots: List[Slot] = []
-    para_indices: List[int] = []
-
-    for idx, p in enumerate(doc.paragraphs):
-        txt = (p.text or "").strip()
-        if not txt:
-            continue
-        if not _is_bullet_paragraph(p):
-            continue
-
-        # Set a max_chars constraint based on existing length; add small buffer
-        # to allow slightly richer keyword insertion without wrapping too often.
-        base_max = min(max(len(txt) + 6, 30), 180)
-        max_chars = max(len(txt), base_max)
-
-        slot = Slot(
-            id=f"p{idx}",
-            text=txt,
-            max_chars=max_chars,
-            keywords_required=keyword_hint[:6],
-        )
-        slots.append(slot)
-        para_indices.append(idx)
+    ranges: List[Tuple[int, int]] = []
+    idx = 0
+    while idx < len(latex_text):
+        start = latex_text.find("\\resumeItem{", idx)
+        if start == -1:
+            break
+        content_start = start + len("\\resumeItem{")
+        depth = 1
+        i = content_start
+        while i < len(latex_text) and depth > 0:
+            ch = latex_text[i]
+            if ch == "{" and latex_text[i - 1] != "\\":
+                depth += 1
+            elif ch == "}" and latex_text[i - 1] != "\\":
+                depth -= 1
+            i += 1
+        if depth != 0:
+            break
+        content_end = i - 1
+        txt = latex_text[content_start:content_end].strip()
+        if txt:
+            base_max = min(max(len(txt) + 6, 30), 140)
+            max_chars = max(len(txt), base_max)
+            slot = Slot(
+                id=f"li{len(slots)}",
+                text=txt,
+                original_text=txt,
+                role_id=f"latex_role_{len(slots) // 10}",
+                slot_type="bullet",
+                max_chars=max_chars,
+                keywords_required=keyword_hint[:6],
+            )
+            slots.append(slot)
+            ranges.append((content_start, content_end))
+        idx = i
 
     if not slots:
         raise HTTPException(
             status_code=400,
-            detail="No bullet/list paragraphs detected in this DOCX. Try using a resume DOCX that uses bullets for experience points.",
+            detail="No \\resumeItem{...} entries found in this LaTeX template.",
+        )
+    return slots, ranges
+
+
+def _parse_latex_skills_section(latex_text: str) -> Optional[Tuple[int, int, str]]:
+    """
+    Extract the technical skills section content inside the first \\item{...} within its itemize block.
+    Returns (start, end, text) or None if not found.
+    """
+    m = re.search(r"\\section\*?\{(Technical Skills|Skills)\}", latex_text)
+    if not m:
+        return None
+    section_start = m.end()
+    rest = latex_text[section_start:]
+
+    begin_itemize = re.search(r"\\begin\{itemize\}(?:\[[^\]]*\])?", rest)
+    if begin_itemize:
+        content_start = section_start + begin_itemize.end()
+        after_begin = latex_text[content_start:]
+        end_itemize = re.search(r"\\end\{itemize\}", after_begin)
+        if end_itemize:
+            itemize_block = after_begin[:end_itemize.start()]
+            item_start = itemize_block.find("\\item{")
+            if item_start != -1:
+                item_content_start = content_start + item_start + len("\\item{")
+                depth = 1
+                i = item_content_start
+                while i < len(latex_text) and depth > 0:
+                    ch = latex_text[i]
+                    if ch == "{" and latex_text[i - 1] != "\\":
+                        depth += 1
+                    elif ch == "}" and latex_text[i - 1] != "\\":
+                        depth -= 1
+                    i += 1
+                if depth == 0:
+                    item_content_end = i - 1
+                    text = latex_text[item_content_start:item_content_end].strip()
+                    return (item_content_start, item_content_end, text)
+
+    next_section = re.search(r"\\section\*?\{", rest)
+    end_doc = re.search(r"\\end\{document\}", rest)
+    if next_section:
+        section_end = section_start + next_section.start()
+    elif end_doc:
+        section_end = section_start + end_doc.start()
+    else:
+        section_end = section_start + len(rest)
+    text = latex_text[section_start:section_end].strip()
+    return (section_start, section_end, text)
+
+
+def _escape_latex(text: str) -> str:
+    # Escape characters that commonly break LaTeX compilation.
+    replacements = {
+        "%": r"\%",
+        "$": r"\$",
+        "&": r"\&",
+        "_": r"\_",
+        "#": r"\#",
+        "{": r"\{",
+        "}": r"\}",
+    }
+    out = []
+    for ch in text:
+        out.append(replacements.get(ch, ch))
+    return "".join(out)
+
+
+def _escape_latex_text_keep_commands(text: str) -> str:
+    # Escape special chars but keep backslashes/braces for existing LaTeX commands.
+    def _escape_char(match: re.Match) -> str:
+        ch = match.group(0)
+        return "\\" + ch
+
+    return re.sub(r"(?<!\\)([%$&#_])", _escape_char, text)
+
+
+def _sanitize_latex_bullet(candidate: str) -> str:
+    """
+    Ensure bullet content contains no LaTeX commands or backslashes.
+    Bullets are plain text inside \\resumeItem{...}.
+    """
+    cleaned = re.sub(r"\\[A-Za-z]+", "", candidate)
+    cleaned = cleaned.replace("\\", "")
+    return cleaned
+
+
+def _sanitize_latex_content(original: str, candidate: str) -> str:
+    """
+    Prevent new LaTeX commands by stripping any backslash commands not present in original.
+    This preserves formatting while avoiding compile-breaking commands.
+    """
+    allowed_cmds = set(re.findall(r"\\[A-Za-z]+", original))
+
+    def _cmd_repl(match: re.Match) -> str:
+        cmd = match.group(0)
+        return cmd if cmd in allowed_cmds else cmd.lstrip("\\")
+
+    cleaned = re.sub(r"\\[A-Za-z]+", _cmd_repl, candidate)
+    return cleaned
+
+
+def _validate_latex_template(content: str) -> None:
+    begin_count = len(re.findall(r"\\begin\{document\}", content))
+    end_count = len(re.findall(r"\\end\{document\}", content))
+    if begin_count != 1 or end_count != 1:
+        raise HTTPException(
+            status_code=400,
+            detail="LaTeX template must contain exactly one \\begin{document} and one \\end{document}.",
         )
 
-    return slots, para_indices
+
+def _apply_replacements(text: str, replacements: List[Tuple[int, int, str]]) -> str:
+    # Apply replacements from back to front to keep indices stable.
+    out = text
+    for start, end, repl in sorted(replacements, key=lambda x: x[0], reverse=True):
+        out = out[:start] + repl + out[end:]
+    return out
 
 
 def _extract_keywords_from_jd(job_description: str) -> List[str]:
@@ -300,15 +420,6 @@ def _extract_keywords_from_jd(job_description: str) -> List[str]:
             out.append(k)
             seen.add(k)
     return out
-
-
-def _extract_docx_text(doc: Document) -> str:
-    parts = []
-    for p in doc.paragraphs:
-        txt = (p.text or "").strip()
-        if txt:
-            parts.append(txt)
-    return "\n".join(parts)
 
 
 def _extract_google_doc_text(doc: dict) -> str:
@@ -447,6 +558,57 @@ def _call_openai_cover_letter_body(job_description: str, resume_text: str) -> st
     return cover_letter.strip()
 
 
+def _call_openai_skills(job_description: str, skills_text: str) -> str:
+    if client is None:
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set in backend/.env")
+    if not skills_text.strip():
+        return skills_text
+
+    instructions = (
+        "You are a resume skills section optimizer.\n"
+        "Goal: update the skills section to better match the job description.\n"
+        "Rules (STRICT):\n"
+        "1) Return JSON ONLY: {\"skills_text\":\"...\"}\n"
+        "2) You MAY add missing skills and keywords aggressively when relevant.\n"
+        "3) Preserve the existing structure (labels and separators) but you can reorder within each label.\n"
+        "4) Do NOT introduce new LaTeX commands.\n"
+        "5) Keep it concise and ATS-friendly.\n"
+        "6) Ensure proper LaTeX escaping for special characters.\n"
+    )
+
+    payload = {
+        "job_description": job_description,
+        "skills_text": skills_text,
+    }
+
+    resp = client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=[
+            {"role": "system", "content": instructions},
+            {"role": "user", "content": json.dumps(payload)},
+        ],
+        response_format={"type": "json_object"},
+        temperature=0.3,
+    )
+
+    text = (resp.choices[0].message.content or "").strip()
+    if not text:
+        return skills_text
+
+    try:
+        data = json.loads(text)
+    except Exception:
+        m = re.search(r"\{.*\}", text, re.DOTALL)
+        if not m:
+            return skills_text
+        data = json.loads(m.group(0))
+
+    updated = data.get("skills_text")
+    if not isinstance(updated, str) or not updated.strip():
+        return skills_text
+    return updated.strip()
+
+
 def _call_openai_greeting(job_description: str) -> str:
     if client is None:
         raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set in backend/.env")
@@ -489,31 +651,22 @@ def _call_openai(job_description: str, slots: List[Slot]) -> List[OptimizeResult
         raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set in backend/.env")
 
     instructions = (
-        "You are a resume optimization engine.\n"
-        "Goal: aggressively tailor resume bullet points to maximize interview selection for a given job description, "
-        "while strictly preserving formatting constraints.\n"
+        "You are a resume bullet rewriting engine.\n"
+        "Goal: tailor resume bullets to maximize interview selection for the job description.\n"
         "\n"
         "Rules (STRICT — MUST FOLLOW ALL):\n"
         "1) Return JSON ONLY in the exact format: {\"results\":[{\"id\":...,\"updated_text\":...}]}. No extra text.\n"
-        "2) updated_text MUST be a single line (no line breaks) and MUST be <= max_chars for that slot.\n"
-        "3) You MAY exaggerate, or generalize experience to maximize role fit.\n"
-        "4) You MUST change job titles, project scope, and responsibilities if it improves alignment.\n"
-        "5) Ensure ALL major keywords, skills, and responsibilities from the job description are explicitly represented.\n"
-        "5.1) DO NOT repeat the same explicit programming language or tool list across multiple bullets for the same role; assume skills mentioned once are implicitly understood in subsequent bullets.\n"
-        "6) Use Google XYZ resume style: concise, impact-driven, narrative bullets.\n"
-        "7) Bullets should read as a coherent story of ownership and impact, not metric-heavy fragments.\n"
-        "8) Optimize strictly for interview selection, not factual accuracy.\n"
-        "9) Preserve ATS-safe formatting; avoid special characters, emojis, or complex punctuation.\n"
-        "10) Each updated_text MUST begin with a strong past-tense action verb (e.g., Built, Led, Designed, Owned).\n"
-        "11) Explicitly surface scale, production, or ownership signals when plausible (e.g., large-scale, production systems).\n"
-        "11.1) Prefer implicit demonstration of skills (e.g., production pipelines, APIs, real-time systems) over explicit language lists unless introducing a skill for the first time in a role.\n"
-        "12) Frame work as ownership of systems, pipelines, or outcomes rather than isolated tasks.\n"
-        "13) Avoid generic soft skills unless directly tied to concrete technical execution.\n"
-        "14) Optimize for recruiter skim (readable in under 6 seconds), not deep technical review.\n"
-        "14.1)Explicit language or tool mentions (e.g., Python, Java, SQL, unit testing) may appear at most ONCE per role unless the job description explicitly requires repetition.\n"
-        "15) If a keyword appears multiple times in the job description, it MUST appear at least once in updated_text.\n"
-        "16) Condense scope where possible to maximize perceived impact rather than fragmented contributions.\n"
-)
+        "2) updated_text MUST be a single line (no line breaks) and MUST be <= max_chars (max 135 chars).\n"
+        "3) Aggressively reword to align with the job description, even if that means rewriting most of the bullet.\n"
+        "4) Start each bullet with a strong past-tense action verb.\n"
+        "5) Use Google XYZ resume style.\n"
+        "6) Include ALL major job-description keywords explicitly; prefer stronger keyword density over subtlety.\n"
+        "7) Quantify results wherever plausible.\n"
+        "8) Bullets should be story-driven but compact; remove filler to make room for keywords.\n"
+        "9) Preserve the essence of each experience (e.g., lab/retail/marketplace/supply chain context).\n"
+        "10) You MAY change job titles as needed to improve alignment.\n"
+        "11) Preserve ATS-safe formatting; avoid special characters or new LaTeX commands.\n"
+    )
 
     payload = {
         "job_description": job_description,
@@ -528,7 +681,7 @@ def _call_openai(job_description: str, slots: List[Slot]) -> List[OptimizeResult
             {"role": "user", "content": json.dumps(payload)},
         ],
         response_format={"type": "json_object"},
-        temperature=0.2,
+        temperature=0.35,
     )
 
     text = (resp.choices[0].message.content or "").strip()
@@ -571,103 +724,48 @@ def _call_openai(job_description: str, slots: List[Slot]) -> List[OptimizeResult
     return results
 
 
-def _replace_paragraph_text_preserve_style(doc: Document, para_idx: int, new_text: str) -> None:
-    p = doc.paragraphs[para_idx]
-    # Preserve paragraph style; replacing runs loses inline styling but keeps paragraph style.
-    # Best effort: preserve the first run's character style if present.
-    first_run_style = None
-    first_run_font = None
-    if p.runs:
-        first_run_style = p.runs[0].style
-        first_run_font = p.runs[0].font
-
-    # Clear runs
-    for r in p.runs[::-1]:
-        try:
-            p._p.remove(r._r)
-        except Exception:
-            pass
-
-    run = p.add_run(new_text)
-    if first_run_style is not None:
-        try:
-            run.style = first_run_style
-        except Exception:
-            pass
-    # Try to keep font size/name if explicitly set on first run
-    if first_run_font is not None:
-        try:
-            run.font.name = first_run_font.name
-        except Exception:
-            pass
-        try:
-            run.font.size = first_run_font.size
-        except Exception:
-            pass
-
-
-def _docx_to_pdf_bytes(docx_bytes: bytes) -> Optional[bytes]:
+def _extract_latex_text(latex_text: str) -> str:
     """
-    Convert docx -> pdf using LibreOffice if available.
-    Returns pdf bytes or None if conversion isn't possible.
+    Extract plain-ish text from LaTeX by pulling resume items + skills section content.
     """
+    keyword_hint: List[str] = []
+    parts: List[str] = []
+    try:
+        slots, _ = _parse_latex_resume_items(latex_text, keyword_hint)
+        parts.extend([s.text for s in slots])
+    except HTTPException:
+        pass
+    skills = _parse_latex_skills_section(latex_text)
+    if skills:
+        parts.append(skills[2])
+    return "\n".join(parts).strip()
+
+
+def _compile_latex_to_pdf_bytes(latex_text: str) -> bytes:
     with tempfile.TemporaryDirectory() as td:
         td_path = os.path.abspath(td)
-        docx_path = os.path.join(td_path, "resume.docx")
-        out_dir = td_path
+        tex_path = os.path.join(td_path, "resume.tex")
+        with open(tex_path, "w", encoding="utf-8") as f:
+            f.write(latex_text)
 
-        with open(docx_path, "wb") as f:
-            f.write(docx_bytes)
-
-        soffice = shutil.which("soffice") or shutil.which("libreoffice")
-        if not soffice:
-            # Common install paths (macOS + Homebrew)
-            candidates = [
-                "/Applications/LibreOffice.app/Contents/MacOS/soffice",
-                "/opt/homebrew/bin/soffice",
-                "/usr/local/bin/soffice",
-            ]
-            for cand in candidates:
-                if os.path.exists(cand):
-                    soffice = cand
-                    break
-        if not soffice:
-            return None
-
-        # Convert
         try:
-            subprocess.run(
-                [
-                    soffice,
-                    "--headless",
-                    "--nologo",
-                    "--nolockcheck",
-                    "--norestore",
-                    "--convert-to",
-                    "pdf",
-                    "--outdir",
-                    out_dir,
-                    docx_path,
-                ],
+            result = subprocess.run(
+                ["pdflatex", "-interaction=nonstopmode", "-halt-on-error", "resume.tex"],
+                cwd=td_path,
                 check=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                timeout=45,
+                timeout=60,
             )
-        except Exception:
-            return None
+        except subprocess.CalledProcessError as exc:
+            err = exc.stdout.decode("utf-8", errors="ignore") + "\n" + exc.stderr.decode("utf-8", errors="ignore")
+            raise HTTPException(status_code=400, detail=f"LaTeX compilation failed:\n{err[-1200:]}")
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"LaTeX compilation error: {exc}")
 
-        pdf_path = os.path.join(out_dir, "resume.pdf")
+        pdf_path = os.path.join(td_path, "resume.pdf")
         if not os.path.exists(pdf_path):
-            # LibreOffice sometimes outputs with same base name
-            for fn in os.listdir(out_dir):
-                if fn.lower().endswith(".pdf"):
-                    pdf_path = os.path.join(out_dir, fn)
-                    break
-
-        if not os.path.exists(pdf_path):
-            return None
-
+            raise HTTPException(status_code=500, detail="PDF output not found after pdflatex.")
         with open(pdf_path, "rb") as f:
             return f.read()
 
@@ -676,6 +774,38 @@ def _docx_to_pdf_bytes(docx_bytes: bytes) -> Optional[bytes]:
 def health():
     return {"ok": True, "model": OPENAI_MODEL, "has_key": bool(OPENAI_API_KEY)}
 
+
+@app.get("/latex/template")
+def get_latex_template():
+    return {"has_template": bool(_latex_template)}
+
+
+@app.get("/latex/last")
+def get_last_compiled_latex():
+    if not _last_compiled_latex:
+        raise HTTPException(status_code=404, detail="No compiled LaTeX available yet.")
+    return {"latex": _last_compiled_latex}
+
+@app.post("/latex/template")
+async def set_latex_template(
+    latex_text: str = Form(None),
+    template: UploadFile = File(None),
+):
+    global _latex_template
+    content = ""
+    if template is not None:
+        if not template.filename.lower().endswith(".tex"):
+            raise HTTPException(status_code=400, detail="Please upload a .tex LaTeX template.")
+        content = (await template.read()).decode("utf-8", errors="ignore")
+    elif latex_text is not None:
+        content = latex_text
+
+    if not content.strip():
+        raise HTTPException(status_code=400, detail="LaTeX template content is empty.")
+
+    _validate_latex_template(content)
+    _latex_template = content
+    return {"ok": True, "message": "LaTeX template saved."}
 
 @app.get("/auth/google")
 def auth_google():
@@ -802,47 +932,48 @@ def coverletter_google_doc(payload: GoogleCoverLetterRequest):
 @app.post("/optimize")
 async def optimize(
     job_description: str = Form(...),
-    resume: UploadFile = File(...),
 ):
-    if not resume.filename.lower().endswith(".docx"):
-        raise HTTPException(status_code=400, detail="Please upload a .docx resume (Word document).")
-
-    resume_bytes = await resume.read()
-    if len(resume_bytes) > 5_000_000:
-        raise HTTPException(status_code=400, detail="File too large (max 5MB).")
-
-    try:
-        doc = Document(io.BytesIO(resume_bytes))
-    except Exception:
-        raise HTTPException(status_code=400, detail="Could not read DOCX. Please upload a valid Word document.")
+    if not _latex_template:
+        raise HTTPException(status_code=400, detail="LaTeX template not set. Upload or paste a .tex template first.")
+    _validate_latex_template(_latex_template)
 
     keyword_hint = _extract_keywords_from_jd(job_description)
-    slots, para_indices = _extract_slots(doc, keyword_hint)
-
+    slots, ranges = _parse_latex_resume_items(_latex_template, keyword_hint)
     results = _call_openai(job_description, slots)
-    # Apply results in document
-    res_by_id = {r.id: r.updated_text for r in results}
-    for slot, pidx in zip(slots, para_indices):
+    slot_by_id = {s.id: s for s in slots}
+    res_by_id = {}
+    for r in results:
+        original = slot_by_id.get(r.id).text if r.id in slot_by_id else r.updated_text
+        sanitized = _sanitize_latex_bullet(r.updated_text)
+        res_by_id[r.id] = _escape_latex(sanitized if sanitized.strip() else original)
+
+    replacements: List[Tuple[int, int, str]] = []
+    for slot, (start, end) in zip(slots, ranges):
         new_text = res_by_id.get(slot.id, slot.text)
-        _replace_paragraph_text_preserve_style(doc, pidx, new_text)
+        replacements.append((start, end, new_text))
 
-    # Save updated docx
-    out_buf = io.BytesIO()
-    doc.save(out_buf)
-    out_docx = out_buf.getvalue()
+    skills = _parse_latex_skills_section(_latex_template)
+    skills_updated = False
+    if skills:
+        s_start, s_end, s_text = skills
+        updated_skills_raw = _call_openai_skills(job_description, s_text)
+        updated_skills = _escape_latex_text_keep_commands(_sanitize_latex_content(s_text, updated_skills_raw))
+        replacements.append((s_start, s_end, updated_skills))
+        skills_updated = True
 
-    # Try PDF conversion (optional)
-    pdf_bytes = _docx_to_pdf_bytes(out_docx)
+    updated_latex = _apply_replacements(_latex_template, replacements)
+    global _last_compiled_latex
+    _last_compiled_latex = updated_latex
+    pdf_bytes = _compile_latex_to_pdf_bytes(updated_latex)
 
-    # Return multipart-ish JSON with base64? We'll return raw bytes endpoints for simplicity:
-    # Here we return JSON with docx bytes as base64 and optional pdf base64.
     import base64
     payload = {
-        "docx_base64": base64.b64encode(out_docx).decode("utf-8"),
-        "pdf_base64": base64.b64encode(pdf_bytes).decode("utf-8") if pdf_bytes else None,
-        "pdf_available": bool(pdf_bytes),
+        "tex_base64": base64.b64encode(updated_latex.encode("utf-8")).decode("utf-8"),
+        "pdf_base64": base64.b64encode(pdf_bytes).decode("utf-8"),
+        "pdf_available": True,
         "bullets_edited": len(results),
         "keyword_hints": keyword_hint,
+        "skills_updated": skills_updated,
     }
     return JSONResponse(payload)
 
@@ -850,20 +981,9 @@ async def optimize(
 @app.post("/coverletter")
 async def coverletter(
     job_description: str = Form(...),
-    resume: UploadFile = File(...),
 ):
-    if not resume.filename.lower().endswith(".docx"):
-        raise HTTPException(status_code=400, detail="Please upload a .docx resume (Word document).")
-
-    resume_bytes = await resume.read()
-    if len(resume_bytes) > 5_000_000:
-        raise HTTPException(status_code=400, detail="File too large (max 5MB).")
-
-    try:
-        doc = Document(io.BytesIO(resume_bytes))
-    except Exception:
-        raise HTTPException(status_code=400, detail="Could not read DOCX. Please upload a valid Word document.")
-
-    resume_text = _extract_docx_text(doc)
+    if not _latex_template:
+        raise HTTPException(status_code=400, detail="LaTeX template not set. Upload or paste a .tex template first.")
+    resume_text = _extract_latex_text(_latex_template)
     cover_letter = _call_openai_cover_letter(job_description, resume_text)
     return {"cover_letter": cover_letter}

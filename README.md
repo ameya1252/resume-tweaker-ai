@@ -1,13 +1,13 @@
 # Resume Tweaker AI (Personal)
 
 A personal tool that:
-- Takes **Job Description** + your **base resume (.docx)**
-- Uses the OpenAI API to tailor your resume **without changing layout** (edits only bullet text)
-- Shows a preview in the browser
-- Lets you download the updated resume as **DOCX** (and **PDF** if LibreOffice is installed)
+- Takes **Job Description** + your **base resume template (.tex)**
+- Uses the OpenAI API to tailor your resume **without changing layout** (edits only specified LaTeX content)
+- Shows a PDF preview in the browser
+- Lets you download the updated **.tex** and **PDF** (via `pdflatex`)
 
-## Why DOCX?
-DOCX lets us preserve paragraph styles (bullets, spacing) while replacing text safely. PDF is much harder to edit without layout drift.
+## Why LaTeX?
+LaTeX is deterministic and layout-stable. We only replace content inside specific commands like `\resumeItem{...}` and the Technical Skills section.
 
 ---
 
@@ -17,8 +17,7 @@ DOCX lets us preserve paragraph styles (bullets, spacing) while replacing text s
 - An OpenAI API key
 
 Optional (for PDF export):
-- **LibreOffice** installed and `soffice` available on PATH  
-  - macOS: install LibreOffice app, then add `soffice` to PATH (see below)
+- **TeX Live** installed and `pdflatex` available on PATH
 
 ---
 
@@ -71,30 +70,18 @@ This starts the backend (port 8000) and frontend (port 5173) together.
 ## Usage
 1. Open the frontend
 2. Paste a job description
-3. Upload your base resume (DOCX) or connect Google Docs
+3. Upload or paste your LaTeX template, then **Save Template**
 4. Click **Optimize**
-5. Preview the updated resume (DOCX mode only)
-6. Download DOCX/PDF (DOCX mode only)
+5. Preview the updated resume (LaTeX mode only)
+6. Download `.tex` and PDF
 7. Use **Cover Letter** to generate a separate cover letter
 
 ---
 
 ## PDF Export Notes
-The backend will attempt to convert DOCX → PDF via LibreOffice (`soffice --headless ...`).
+The backend compiles LaTeX → PDF via `pdflatex -interaction=nonstopmode`.
 
-### macOS PATH tip
-LibreOffice typically installs `soffice` here:
-
-- `/Applications/LibreOffice.app/Contents/MacOS/soffice`
-
-You can add this to PATH for your shell, e.g. zsh:
-
-```bash
-echo 'export PATH="/Applications/LibreOffice.app/Contents/MacOS:$PATH"' >> ~/.zshrc
-source ~/.zshrc
-```
-
-Then restart the backend.
+Ensure TeX Live is installed and `pdflatex` is on your PATH, then restart the backend.
 
 ---
 
