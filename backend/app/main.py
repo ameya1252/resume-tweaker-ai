@@ -48,6 +48,9 @@ _google_state: Optional[str] = None
 _google_creds_data: Optional[Dict[str, str]] = None
 _latex_template: Optional[str] = None
 _last_compiled_latex: Optional[str] = None
+_last_optimized_latex: Optional[str] = None
+_last_bullet_ranges: Dict[str, Tuple[int, int, Optional[str]]] = {}
+_last_template_fingerprint: Optional[int] = None
 _request_cache: contextvars.ContextVar[Optional[Dict[str, object]]] = contextvars.ContextVar(
     "request_cache",
     default=None,
@@ -113,6 +116,7 @@ class Slot(BaseModel):
     slot_type: str = "bullet"
     max_chars: int = Field(ge=10, le=1200)
     keywords_required: List[str] = Field(default_factory=list)
+    experience_id: Optional[str] = None
 
 
 class OptimizeResult(BaseModel):
@@ -173,6 +177,18 @@ class GoogleCoverLetterRequest(BaseModel):
 
 class LatexTemplateRequest(BaseModel):
     latex_text: str
+
+
+class DraftApplyItem(BaseModel):
+    id: str
+    text: str
+    experience_id: Optional[str] = None
+
+
+class DraftApplyRequest(BaseModel):
+    titles: Optional[List[DraftApplyItem]] = None
+    bullets: Optional[List[DraftApplyItem]] = None
+    skills: Optional[str] = None
 
 
 def _google_flow() -> Flow:
@@ -244,54 +260,120 @@ def _extract_google_doc_slots(doc: dict, keyword_hint: List[str]) -> Tuple[List[
     return slots, ranges
 
 
-def _parse_latex_resume_items(latex_text: str, keyword_hint: List[str]) -> Tuple[List[Slot], List[Tuple[int, int]]]:
+def _parse_latex_resume_items(latex_text: str, keyword_hint: List[str]) -> List[Dict[str, object]]:
     """
-    Deterministically parse \\resumeItem{...} blocks using brace depth tracking.
-    Returns slots and (start, end) indices for the inner content only.
+    Parse \\resumeItem{...} blocks grouped by \\resumeSubheading.
+    Each group includes experience metadata and its bullet entries with ranges.
     """
-    slots: List[Slot] = []
-    ranges: List[Tuple[int, int]] = []
-    idx = 0
-    while idx < len(latex_text):
-        start = latex_text.find("\\resumeItem{", idx)
-        if start == -1:
-            break
-        content_start = start + len("\\resumeItem{")
-        depth = 1
-        i = content_start
-        while i < len(latex_text) and depth > 0:
-            ch = latex_text[i]
-            if ch == "{" and latex_text[i - 1] != "\\":
-                depth += 1
-            elif ch == "}" and latex_text[i - 1] != "\\":
-                depth -= 1
-            i += 1
-        if depth != 0:
-            break
-        content_end = i - 1
-        txt = latex_text[content_start:content_end].strip()
-        if txt:
-            base_max = min(max(len(txt) + 6, 30), 140)
-            max_chars = max(len(txt), base_max)
-            slot = Slot(
-                id=f"li{len(slots)}",
-                text=txt,
-                original_text=txt,
-                role_id=f"latex_role_{len(slots) // 10}",
-                slot_type="bullet",
-                max_chars=max_chars,
-                keywords_required=keyword_hint[:6],
-            )
-            slots.append(slot)
-            ranges.append((content_start, content_end))
-        idx = i
+    section_match = re.search(r"\\section\*?\{Experience\}", latex_text, re.IGNORECASE)
+    if not section_match:
+        raise HTTPException(
+            status_code=400,
+            detail="No \\section{Experience} found in this LaTeX template.",
+        )
+    section_start = section_match.start()
+    rest = latex_text[section_match.end():]
+    next_section = re.search(r"\\section\*?\{", rest)
+    section_end = section_match.end() + (next_section.start() if next_section else len(rest))
 
-    if not slots:
+    subheadings, _ = _parse_latex_resume_subheadings(latex_text)
+    if not subheadings:
+        raise HTTPException(
+            status_code=400,
+            detail="No \\resumeSubheading{...} entries found in this LaTeX template.",
+        )
+
+    groups: List[Dict[str, object]] = []
+    bullet_count = 0
+    subheadings = [
+        s for s in subheadings
+        if section_start <= int(s.get("block_start", 0)) < section_end
+    ]
+    if not subheadings:
+        raise HTTPException(
+            status_code=400,
+            detail="No \\resumeSubheading entries found inside the Experience section.",
+        )
+
+    for idx, sub in enumerate(subheadings):
+        block_start = int(sub.get("block_start", 0))
+        block_end = int(sub.get("block_end", block_start))
+        next_sub_start = None
+        if idx + 1 < len(subheadings):
+            next_sub_start = int(subheadings[idx + 1].get("block_start", len(latex_text)))
+        rest = latex_text[block_end:]
+        m_section = re.search(r"\\section\*?\{", rest)
+        next_section_start = block_end + m_section.start() if m_section else None
+
+        boundary_candidates = [len(latex_text)]
+        if next_sub_start is not None:
+            boundary_candidates.append(next_sub_start)
+        if next_section_start is not None:
+            boundary_candidates.append(next_section_start)
+        boundary = min(boundary_candidates)
+        boundary = min(boundary, section_end)
+
+        bullets: List[Dict[str, object]] = []
+        scan_idx = block_end
+        while scan_idx < boundary:
+            start = latex_text.find("\\resumeItem{", scan_idx)
+            if start == -1 or start >= boundary:
+                break
+            content_start = start + len("\\resumeItem{")
+            depth = 1
+            i = content_start
+            while i < len(latex_text) and depth > 0:
+                ch = latex_text[i]
+                if ch == "{" and latex_text[i - 1] != "\\":
+                    depth += 1
+                elif ch == "}" and latex_text[i - 1] != "\\":
+                    depth -= 1
+                i += 1
+            if depth != 0:
+                break
+            content_end = i - 1
+            if content_end > boundary:
+                break
+            txt = latex_text[content_start:content_end].strip()
+            if txt:
+                base_max = min(max(len(txt) + 6, 30), 140)
+                max_chars = max(len(txt), base_max)
+                slot = Slot(
+                    id=f"li{bullet_count}",
+                    text=txt,
+                    original_text=txt,
+                    role_id=f"latex_role_{bullet_count // 10}",
+                    slot_type="bullet",
+                    max_chars=max_chars,
+                    keywords_required=keyword_hint[:6],
+                    experience_id=str(sub.get("id", "")),
+                )
+                bullets.append(
+                    {
+                        "id": slot.id,
+                        "text": txt,
+                        "range": (content_start, content_end),
+                        "slot": slot,
+                    }
+                )
+                bullet_count += 1
+            scan_idx = i
+
+        groups.append(
+            {
+                "experience_id": str(sub.get("id", "")),
+                "company": str(sub.get("company", "")),
+                "title": str(sub.get("title", "")),
+                "bullets": bullets,
+            }
+        )
+
+    if bullet_count == 0:
         raise HTTPException(
             status_code=400,
             detail="No \\resumeItem{...} entries found in this LaTeX template.",
         )
-    return slots, ranges
+    return groups
 
 
 def _parse_latex_resume_subheadings(latex_text: str) -> Tuple[List[Dict[str, object]], List[Tuple[int, int]]]:
@@ -351,6 +433,8 @@ def _parse_latex_resume_subheadings(latex_text: str) -> Tuple[List[Dict[str, obj
                     "title": fields[2],
                     "dates": fields[3],
                     "title_range": [title_start, title_end],
+                    "block_start": start,
+                    "block_end": i,
                 }
             )
             ranges.append((title_start, title_end))
@@ -413,6 +497,38 @@ def _parse_latex_skills_section(latex_text: str) -> Optional[Tuple[int, int, str
         section_end = section_start + len(rest)
     text = latex_text[section_start:section_end].strip()
     return (section_start, section_end, text)
+
+
+def _flatten_latex_bullets(grouped: List[Dict[str, object]]) -> Tuple[List[Slot], List[Tuple[int, int]]]:
+    slots: List[Slot] = []
+    ranges: List[Tuple[int, int]] = []
+    for group in grouped:
+        bullets = group.get("bullets", [])
+        for b in bullets:
+            slot = b.get("slot")
+            if isinstance(slot, Slot):
+                slots.append(slot)
+            else:
+                txt = str(b.get("text", "")).strip()
+                if not txt:
+                    continue
+                base_max = min(max(len(txt) + 6, 30), 140)
+                max_chars = max(len(txt), base_max)
+                slot = Slot(
+                    id=str(b.get("id", f"li{len(slots)}")),
+                    text=txt,
+                    original_text=txt,
+                    role_id=f"latex_role_{len(slots) // 10}",
+                    slot_type="bullet",
+                    max_chars=max_chars,
+                    keywords_required=[],
+                    experience_id=str(group.get("experience_id", "")),
+                )
+                slots.append(slot)
+            rng = b.get("range")
+            if isinstance(rng, tuple) and len(rng) == 2:
+                ranges.append((int(rng[0]), int(rng[1])))
+    return slots, ranges
 
 
 def _escape_latex(text: str) -> str:
@@ -1076,7 +1192,8 @@ def _extract_latex_text(latex_text: str) -> str:
     keyword_hint: List[str] = []
     parts: List[str] = []
     try:
-        slots, _ = _parse_latex_resume_items(latex_text, keyword_hint)
+        grouped = _parse_latex_resume_items(latex_text, keyword_hint)
+        slots, _ = _flatten_latex_bullets(grouped)
         parts.extend([s.text for s in slots])
     except HTTPException:
         pass
@@ -1292,7 +1409,8 @@ async def optimize(
         job_analysis = _analyze_job_description(job_description)
         subheadings, title_ranges = _parse_latex_resume_subheadings(_latex_template)
         keyword_hint = _extract_keywords_from_jd(job_description)
-        slots, ranges = _parse_latex_resume_items(_latex_template, keyword_hint)
+        grouped = _parse_latex_resume_items(_latex_template, keyword_hint)
+        slots, ranges = _flatten_latex_bullets(grouped)
         existing_bullets = [s.text for s in slots]
         updated_title_meta: List[Dict[str, str]] = []
         title_replacements: List[Tuple[int, int, str]] = []
@@ -1362,8 +1480,19 @@ async def optimize(
         audit = _call_openai_audit(audit_title, rewritten_bullets, audit_skills_text)
 
         updated_latex = _apply_replacements(_latex_template, replacements)
-        global _last_compiled_latex
+        global _last_compiled_latex, _last_optimized_latex
         _last_compiled_latex = updated_latex
+        _last_optimized_latex = updated_latex
+        global _last_bullet_ranges, _last_template_fingerprint
+        try:
+            updated_grouped = _parse_latex_resume_items(updated_latex, keyword_hint)
+            updated_slots, updated_ranges = _flatten_latex_bullets(updated_grouped)
+        except HTTPException:
+            updated_slots, updated_ranges = slots, ranges
+        _last_bullet_ranges = {
+            s.id: (r[0], r[1], s.experience_id) for s, r in zip(updated_slots, updated_ranges)
+        }
+        _last_template_fingerprint = hash(updated_latex)
         pdf_bytes = _compile_latex_to_pdf_bytes(updated_latex)
 
         import base64
@@ -1376,10 +1505,101 @@ async def optimize(
             "skills_updated": skills_updated,
             "updated_titles": updated_title_meta,
             "audit": audit,
+            "draft": {
+                "titles": [{"id": t.get("id", ""), "text": t.get("updated_title", "")} for t in updated_title_meta],
+                "bullets": [
+                    {
+                        "id": s.id,
+                        "text": res_by_id.get(s.id, s.text),
+                        "experience_id": s.experience_id,
+                    }
+                    for s in slots
+                ],
+                "skills": audit_skills_text,
+            },
         }
         return JSONResponse(payload)
     finally:
         _request_cache.reset(cache_token)
+
+
+@app.post("/draft/apply")
+async def apply_draft_edits(payload: DraftApplyRequest):
+    global _last_compiled_latex, _last_optimized_latex
+    if not _latex_template:
+        raise HTTPException(status_code=400, detail="LaTeX template not set. Upload or paste a .tex template first.")
+    _validate_latex_template(_latex_template)
+
+    title_edits = {t.id: t.text for t in (payload.titles or [])}
+    bullet_edits = {b.id: b for b in (payload.bullets or [])}
+    skills_edit = payload.skills
+
+    if not title_edits and not bullet_edits and skills_edit is None:
+        raise HTTPException(status_code=400, detail="No draft edits provided.")
+
+    title_map: Dict[str, Tuple[Dict[str, object], Tuple[int, int]]] = {}
+    baseline = _last_optimized_latex or _latex_template
+
+    if title_edits:
+        subheadings, title_ranges = _parse_latex_resume_subheadings(baseline)
+        title_map = {s.get("id", ""): (s, r) for s, r in zip(subheadings, title_ranges)}
+    if bullet_edits:
+        if _last_template_fingerprint is None or _last_template_fingerprint != hash(baseline):
+            raise HTTPException(status_code=400, detail="Bullet ranges are out of date. Re-run optimize.")
+        if not _last_bullet_ranges:
+            raise HTTPException(status_code=400, detail="No stored bullet ranges. Re-run optimize.")
+    skills = _parse_latex_skills_section(baseline)
+
+    unknown_titles = [tid for tid in title_edits if tid not in title_map]
+    unknown_bullets = [bid for bid in bullet_edits if bid not in _last_bullet_ranges]
+    if unknown_titles or unknown_bullets:
+        missing = ", ".join(unknown_titles + unknown_bullets)
+        raise HTTPException(status_code=400, detail=f"Unknown draft ids: {missing}")
+
+    replacements: List[Tuple[int, int, str]] = []
+
+    for tid, text in title_edits.items():
+        cleaned = text.replace("\n", " ").strip()
+        if len(cleaned) > 200:
+            raise HTTPException(status_code=400, detail="Title edits must be <= 200 characters.")
+        _, (start, end) = title_map[tid]
+        original_raw = baseline[start:end]
+        replacements.append((start, end, _format_title_replacement(original_raw, cleaned)))
+
+    for bid, edit in bullet_edits.items():
+        exp_id = (edit.experience_id or "").strip()
+        start, end, stored_exp = _last_bullet_ranges[bid]
+        if not exp_id:
+            raise HTTPException(status_code=400, detail="Bullet edits must include experience_id.")
+        if stored_exp and exp_id != stored_exp:
+            raise HTTPException(status_code=400, detail=f"Bullet experience_id mismatch for {bid}.")
+        text = edit.text
+        cleaned = text.replace("\n", " ").strip()
+        if len(cleaned) > 180:
+            raise HTTPException(status_code=400, detail="Bullet edits must be <= 180 characters.")
+        sanitized = _sanitize_latex_bullet(cleaned)
+        escaped = _escape_latex(sanitized if sanitized.strip() else cleaned)
+        replacements.append((start, end, escaped))
+
+    if skills_edit is not None:
+        if not skills:
+            raise HTTPException(status_code=400, detail="Skills section not found in this LaTeX template.")
+        s_start, s_end, s_text = skills
+        candidate = skills_edit.replace("\n", " ").strip()
+        sanitized = _sanitize_latex_content(s_text, candidate)
+        escaped = _escape_latex_text_keep_commands(sanitized)
+        replacements.append((s_start, s_end, escaped))
+
+    updated_latex = _apply_replacements(baseline, replacements)
+    _last_compiled_latex = updated_latex
+    _last_optimized_latex = updated_latex
+    pdf_bytes = _compile_latex_to_pdf_bytes(updated_latex)
+
+    import base64
+    return {
+        "pdf_base64": base64.b64encode(pdf_bytes).decode("utf-8"),
+        "pdf_available": True,
+    }
 
 
 @app.post("/coverletter")
