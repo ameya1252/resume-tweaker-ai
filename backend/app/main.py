@@ -276,6 +276,7 @@ def _parse_latex_resume_items(latex_text: str, keyword_hint: List[str]) -> List[
     next_section = re.search(r"\\section\*?\{", rest)
     section_end = section_match.end() + (next_section.start() if next_section else len(rest))
 
+    education_range = _latex_section_range(latex_text, "Education")
     subheadings, _ = _parse_latex_resume_subheadings(latex_text)
     if not subheadings:
         raise HTTPException(
@@ -319,6 +320,9 @@ def _parse_latex_resume_items(latex_text: str, keyword_hint: List[str]) -> List[
             start = latex_text.find("\\resumeItem{", scan_idx)
             if start == -1 or start >= boundary:
                 break
+            if education_range and education_range[0] <= start < education_range[1]:
+                scan_idx = start + len("\\resumeItem{")
+                continue
             content_start = start + len("\\resumeItem{")
             depth = 1
             i = content_start
@@ -655,6 +659,21 @@ def _extract_keywords_from_jd(job_description: str) -> List[str]:
             out.append(k)
             seen.add(k)
     return out
+
+
+def _latex_section_range(latex: str, section_name: str) -> Optional[Tuple[int, int]]:
+    """
+    Return the (start, end) indices for the body of a LaTeX section by name.
+    """
+    needle = f"\\section{{{section_name}}}"
+    start = latex.find(needle)
+    if start == -1:
+        return None
+    body_start = start + len(needle)
+    next_section = latex.find("\\section{", body_start)
+    if next_section == -1:
+        return (body_start, len(latex))
+    return (body_start, next_section)
 
 
 def _extract_google_doc_text(doc: dict) -> str:
@@ -1408,6 +1427,7 @@ async def optimize(
 
         job_analysis = _analyze_job_description(job_description)
         subheadings, title_ranges = _parse_latex_resume_subheadings(_latex_template)
+        education_range = _latex_section_range(_latex_template, "Education")
         keyword_hint = _extract_keywords_from_jd(job_description)
         grouped = _parse_latex_resume_items(_latex_template, keyword_hint)
         slots, ranges = _flatten_latex_bullets(grouped)
@@ -1416,6 +1436,9 @@ async def optimize(
         title_replacements: List[Tuple[int, int, str]] = []
 
         for subheading, (t_start, t_end) in zip(subheadings, title_ranges):
+            start_idx = int(subheading.get("block_start", 0))
+            if education_range and education_range[0] <= start_idx < education_range[1]:
+                continue
             original_title = str(subheading.get("title", ""))
             company = str(subheading.get("company", ""))
             role_frame = _call_openai_role_frame(
@@ -1505,6 +1528,7 @@ async def optimize(
             "skills_updated": skills_updated,
             "updated_titles": updated_title_meta,
             "audit": audit,
+            "locked_sections": ["Education"],
             "draft": {
                 "titles": [{"id": t.get("id", ""), "text": t.get("updated_title", "")} for t in updated_title_meta],
                 "bullets": [
@@ -1543,6 +1567,16 @@ async def apply_draft_edits(payload: DraftApplyRequest):
     if title_edits:
         subheadings, title_ranges = _parse_latex_resume_subheadings(baseline)
         title_map = {s.get("id", ""): (s, r) for s, r in zip(subheadings, title_ranges)}
+        education_range = _latex_section_range(baseline, "Education")
+        if education_range:
+            for tid in title_edits:
+                sub, _ = title_map.get(tid, ({}, (0, 0)))
+                start_idx = int(sub.get("block_start", 0)) if isinstance(sub, dict) else 0
+                if education_range[0] <= start_idx < education_range[1]:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Education section is locked and cannot be edited.",
+                    )
     if bullet_edits:
         if _last_template_fingerprint is None or _last_template_fingerprint != hash(baseline):
             raise HTTPException(status_code=400, detail="Bullet ranges are out of date. Re-run optimize.")
