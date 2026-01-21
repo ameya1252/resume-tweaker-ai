@@ -1049,7 +1049,8 @@ def _call_openai_role_frame(
         raise HTTPException(status_code=500, detail="OpenAI returned invalid role_summary.")
     role_summary = role_summary.strip()
     if len(role_summary) > 200:
-        raise HTTPException(status_code=500, detail="OpenAI returned role_summary over 200 characters.")
+        truncated = role_summary[:200]
+        role_summary = truncated.rsplit(" ", 1)[0] or truncated
 
     updated_title_valid = isinstance(updated_title, str) and updated_title.strip()
     if updated_title_valid:
