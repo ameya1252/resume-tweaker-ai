@@ -134,6 +134,22 @@ class RoleFrame(BaseModel):
     updated_title: str = Field(max_length=80)
     role_summary: str = Field(max_length=200)
 
+FULL_RESUME_REWRITE_PROMPT = (
+    "what do i tweak in my resume to guarentee an interview at this job description.\n"
+    "make sure all the keywords are included. i am experimenting a personal project to see how well gpt performs.\n"
+    "so you can make up stuff as well if needed.\n"
+    "make sure the bullets are about the same size like the prev ones or they wont fit in there (max 135 chars).\n"
+    "make sure its in google xyz format.\n"
+    "also each line does not need to have data and more of a story of my project.\n"
+    "change the job titles as needed.\n"
+    "make sure to quantify the results as well in the bullets where needed.\n"
+    "\n"
+    "also make sure you dont forget the essence of each exp\n"
+    "like dahl lab was ultrasound lab,\n"
+    "tractor supply is a retail company,\n"
+    "campusx is a student marketplace,\n"
+    "p&g is retail and supply chain."
+)
 
 COVER_LETTER_INSTRUCTIONS = (
     "You are a cover letter writing engine.\n"
@@ -380,6 +396,273 @@ def _parse_latex_resume_items(latex_text: str, keyword_hint: List[str]) -> List[
     return groups
 
 
+def _section_range_any(latex: str, section_name: str) -> Optional[Tuple[int, int]]:
+    needle = f"\\section{{{section_name}}}"
+    start = latex.find(needle)
+    if start == -1:
+        needle = f"\\section*{{{section_name}}}"
+        start = latex.find(needle)
+        if start == -1:
+            return None
+    body_start = start + len(needle)
+    next_section = latex.find("\\section{", body_start)
+    next_section_star = latex.find("\\section*{", body_start)
+    candidates = [idx for idx in (next_section, next_section_star) if idx != -1]
+    if not candidates:
+        return (body_start, len(latex))
+    return (body_start, min(candidates))
+
+
+def _scan_resume_items(latex_text: str, start: int, end: int) -> List[Dict[str, object]]:
+    bullets: List[Dict[str, object]] = []
+    scan_idx = start
+    while scan_idx < end:
+        item_start = latex_text.find("\\resumeItem{", scan_idx)
+        if item_start == -1 or item_start >= end:
+            break
+        content_start = item_start + len("\\resumeItem{")
+        depth = 1
+        i = content_start
+        while i < len(latex_text) and depth > 0:
+            ch = latex_text[i]
+            if ch == "{" and latex_text[i - 1] != "\\":
+                depth += 1
+            elif ch == "}" and latex_text[i - 1] != "\\":
+                depth -= 1
+            i += 1
+        if depth != 0:
+            break
+        content_end = i - 1
+        if content_end > end:
+            break
+        text = latex_text[content_start:content_end].strip()
+        bullets.append(
+            {
+                "text": text,
+                "range": (content_start, content_end),
+            }
+        )
+        scan_idx = i
+    return bullets
+
+
+def _parse_experience_groups(latex_text: str) -> List[Dict[str, object]]:
+    section_range = _section_range_any(latex_text, "Experience")
+    if not section_range:
+        raise HTTPException(
+            status_code=400,
+            detail="No \\section{Experience} found in this LaTeX template.",
+        )
+    section_start, section_end = section_range
+    subheadings, title_ranges = _parse_latex_resume_subheadings(latex_text)
+    filtered = [
+        (s, r)
+        for s, r in zip(subheadings, title_ranges)
+        if section_start <= int(s.get("block_start", 0)) < section_end
+    ]
+    if not filtered:
+        raise HTTPException(
+            status_code=400,
+            detail="No \\resumeSubheading entries found inside the Experience section.",
+        )
+
+    groups: List[Dict[str, object]] = []
+    bullet_count = 0
+    for idx, (sub, title_range) in enumerate(filtered):
+        block_end = int(sub.get("block_end", 0))
+        next_start = None
+        if idx + 1 < len(filtered):
+            next_start = int(filtered[idx + 1][0].get("block_start", len(latex_text)))
+        boundary = min(next_start or len(latex_text), section_end)
+
+        bullets = []
+        for b in _scan_resume_items(latex_text, block_end, boundary):
+            bullets.append(
+                {
+                    "id": f"li{bullet_count}",
+                    "text": b.get("text", ""),
+                    "range": b.get("range", (0, 0)),
+                }
+            )
+            bullet_count += 1
+
+        groups.append(
+            {
+                "experience_id": str(sub.get("id", "")),
+                "company": str(sub.get("company", "")),
+                "title": str(sub.get("title", "")),
+                "dates": str(sub.get("dates", "")),
+                "title_range": title_range,
+                "bullets": bullets,
+            }
+        )
+
+    return groups
+
+
+def _parse_project_groups(latex_text: str) -> List[Dict[str, object]]:
+    section_range = _section_range_any(latex_text, "Projects")
+    if not section_range:
+        return []
+    section_start, section_end = section_range
+
+    headings: List[Dict[str, object]] = []
+    idx = section_start
+    needle = "\\resumeProjectHeading"
+    while idx < section_end:
+        start = latex_text.find(needle, idx)
+        if start == -1 or start >= section_end:
+            break
+        i = start + len(needle)
+        while i < len(latex_text) and latex_text[i].isspace():
+            i += 1
+        if i >= len(latex_text) or latex_text[i] != "{":
+            idx = i
+            continue
+        fields: List[str] = []
+        parse_failed = False
+        for _ in range(2):
+            if i >= len(latex_text) or latex_text[i] != "{":
+                parse_failed = True
+                break
+            content_start = i + 1
+            depth = 1
+            j = content_start
+            while j < len(latex_text) and depth > 0:
+                ch = latex_text[j]
+                if ch == "{" and latex_text[j - 1] != "\\":
+                    depth += 1
+                elif ch == "}" and latex_text[j - 1] != "\\":
+                    depth -= 1
+                j += 1
+            if depth != 0:
+                parse_failed = True
+                break
+            content_end = j - 1
+            fields.append(latex_text[content_start:content_end].strip())
+            i = j
+            while i < len(latex_text) and latex_text[i].isspace():
+                i += 1
+        if not parse_failed and len(fields) == 2:
+            headings.append(
+                {
+                    "name": fields[0],
+                    "dates": fields[1],
+                    "block_start": start,
+                    "block_end": i,
+                }
+            )
+        idx = i if i > start else start + len(needle)
+
+    if not headings:
+        try:
+            subheadings, _ = _parse_latex_resume_subheadings(latex_text)
+        except HTTPException:
+            subheadings = []
+        for sub in subheadings:
+            block_start = int(sub.get("block_start", 0))
+            if section_start <= block_start < section_end:
+                name = str(sub.get("company", "")).strip() or str(sub.get("title", "")).strip()
+                headings.append(
+                    {
+                        "name": name,
+                        "dates": str(sub.get("dates", "")),
+                        "block_start": block_start,
+                        "block_end": int(sub.get("block_end", 0)),
+                    }
+                )
+
+    groups: List[Dict[str, object]] = []
+    for idx, heading in enumerate(headings):
+        block_end = int(heading.get("block_end", 0))
+        next_start = None
+        if idx + 1 < len(headings):
+            next_start = int(headings[idx + 1].get("block_start", len(latex_text)))
+        boundary = min(next_start or len(latex_text), section_end)
+        bullets = _scan_resume_items(latex_text, block_end, boundary)
+        groups.append(
+            {
+                "name": str(heading.get("name", "")),
+                "bullets": bullets,
+            }
+        )
+    return groups
+
+
+def _truncate_preserve_words(text: str, max_len: int) -> str:
+    cleaned = text.strip()
+    if len(cleaned) <= max_len:
+        return cleaned
+    truncated = cleaned[:max_len].rstrip()
+    if " " not in truncated:
+        return truncated
+    return truncated.rsplit(" ", 1)[0].rstrip()
+
+
+def _replace_unicode_artifacts(text: str) -> str:
+    return (
+        text.replace("Â¡", "under ")
+        .replace("¡", "under ")
+    )
+
+
+def _format_skills_headings(text: str) -> str:
+    normalized = text.replace("\\\\", " ").replace("\n", " ")
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    normalized = re.sub(r"\\textbf\{([^}]*)\}", r"\1", normalized)
+    pattern = re.compile(r"([A-Za-z][A-Za-z0-9/&\-\s]*?:)")
+    matches = list(pattern.finditer(normalized))
+    if not matches:
+        return text.strip()
+
+    lines: List[str] = []
+    prefix = normalized[:matches[0].start()].strip()
+    if prefix:
+        lines.append(prefix)
+    for i, m in enumerate(matches):
+        heading = m.group(1).strip()
+        start = m.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(normalized)
+        content = normalized[start:end].strip()
+        if not content:
+            continue
+        lines.append(f"\\textbf{{{heading}}} {content}")
+    return " \\\\ ".join(lines).strip()
+
+
+def _extract_resume_plain_text(latex_text: str) -> str:
+    parts: List[str] = []
+    experiences = _parse_experience_groups(latex_text)
+    for exp in experiences:
+        header = " | ".join(
+            [exp.get("company", ""), exp.get("title", ""), exp.get("dates", "")]
+        ).strip(" |")
+        if header:
+            parts.append(header)
+        for b in exp.get("bullets", []):
+            txt = str(b.get("text", "")).strip()
+            if txt:
+                parts.append(f"- {txt}")
+
+    projects = _parse_project_groups(latex_text)
+    if projects:
+        parts.append("Projects")
+    for proj in projects:
+        name = str(proj.get("name", "")).strip()
+        if name:
+            parts.append(name)
+        for b in proj.get("bullets", []):
+            txt = str(b.get("text", "")).strip()
+            if txt:
+                parts.append(f"- {txt}")
+
+    skills = _parse_latex_skills_section(latex_text)
+    if skills:
+        parts.append("Skills")
+        parts.append(skills[2])
+
+    return "\n".join([p for p in parts if p]).strip()
+
 def _parse_latex_resume_subheadings(latex_text: str) -> Tuple[List[Dict[str, object]], List[Tuple[int, int]]]:
     """
     Deterministically parse \\resumeSubheading{...}{...}{...}{...} blocks using brace depth tracking.
@@ -577,6 +860,7 @@ def _sanitize_latex_content(original: str, candidate: str) -> str:
     This preserves formatting while avoiding compile-breaking commands.
     """
     allowed_cmds = set(re.findall(r"\\[A-Za-z]+", original))
+    allowed_cmds.add("\\textbf")
 
     def _cmd_repl(match: re.Match) -> str:
         cmd = match.group(0)
@@ -811,6 +1095,76 @@ def _call_openai_cover_letter_body(job_description: str, resume_text: str) -> st
         raise HTTPException(status_code=500, detail="OpenAI returned invalid cover letter output.")
     return cover_letter.strip()
 
+
+def _call_openai_full_resume_rewrite(job_description: str, resume_text: str) -> Dict[str, object]:
+    if client is None:
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set in backend/.env")
+    if not resume_text.strip():
+        raise HTTPException(status_code=400, detail="Resume text is empty; cannot optimize.")
+
+    instructions = (
+        "You rewrite an entire resume based on a job description.\n"
+        "Return JSON ONLY in this format:\n"
+        "{\n"
+        "  \"experiences\": [\n"
+        "    {\"company\":\"...\",\"title\":\"...\",\"dates\":\"...\",\"bullets\":[\"...\"]}\n"
+        "  ],\n"
+        "  \"projects\": [\n"
+        "    {\"name\":\"...\",\"bullets\":[\"...\"]}\n"
+        "  ],\n"
+        "  \"skills\": \"...\"\n"
+        "}\n"
+        "No extra keys. No markdown."
+    )
+
+    user_content = (
+        f"{FULL_RESUME_REWRITE_PROMPT}\n\n"
+        "RESUME:\n"
+        f"{resume_text}\n\n"
+        "JOB DESCRIPTION:\n"
+        f"{job_description}"
+    )
+
+    resp = client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=[
+            {"role": "system", "content": instructions},
+            {"role": "user", "content": user_content},
+        ],
+        response_format={"type": "json_object"},
+        temperature=0.4,
+    )
+
+    text = (resp.choices[0].message.content or "").strip()
+    if not text:
+        raise HTTPException(status_code=500, detail="OpenAI returned empty output.")
+    try:
+        data = json.loads(text)
+    except Exception:
+        m = re.search(r"\{.*\}", text, re.DOTALL)
+        if not m:
+            raise HTTPException(status_code=500, detail=f"Could not parse OpenAI JSON output. Raw: {text[:400]}")
+        data = json.loads(m.group(0))
+
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=500, detail="OpenAI returned invalid resume output.")
+
+    experiences = data.get("experiences", [])
+    projects = data.get("projects", [])
+    skills = data.get("skills", "")
+
+    if not isinstance(experiences, list):
+        raise HTTPException(status_code=500, detail="OpenAI returned invalid experiences list.")
+    if not isinstance(projects, list):
+        raise HTTPException(status_code=500, detail="OpenAI returned invalid projects list.")
+    if not isinstance(skills, str):
+        raise HTTPException(status_code=500, detail="OpenAI returned invalid skills text.")
+
+    return {
+        "experiences": experiences,
+        "projects": projects,
+        "skills": skills.strip(),
+    }
 
 def _call_openai_skills(job_description: str, skills_text: str) -> str:
     if client is None:
@@ -1416,130 +1770,138 @@ async def optimize(
     job_description: str = Form(...),
     risk_level: str = Form("balanced"),
 ):
+    global _last_compiled_latex, _last_optimized_latex, _last_bullet_ranges, _last_template_fingerprint
     if not _latex_template:
         raise HTTPException(status_code=400, detail="LaTeX template not set. Upload or paste a .tex template first.")
     _validate_latex_template(_latex_template)
 
     cache_token = _request_cache.set({})
     try:
-        risk_level = risk_level.strip().lower()
-        if risk_level not in {"conservative", "balanced", "aggressive"}:
-            raise HTTPException(status_code=400, detail="risk_level must be conservative, balanced, or aggressive.")
+        baseline = _latex_template
+        resume_text = _extract_resume_plain_text(baseline)
+        rewritten = _call_openai_full_resume_rewrite(job_description, resume_text)
 
-        job_analysis = _analyze_job_description(job_description)
-        subheadings, title_ranges = _parse_latex_resume_subheadings(_latex_template)
-        education_range = _latex_section_range(_latex_template, "Education")
-        keyword_hint = _extract_keywords_from_jd(job_description)
-        grouped = _parse_latex_resume_items(_latex_template, keyword_hint)
-        slots, ranges = _flatten_latex_bullets(grouped)
-        existing_bullets = [s.text for s in slots]
-        updated_title_meta: List[Dict[str, str]] = []
-        title_replacements: List[Tuple[int, int, str]] = []
-
-        for subheading, (t_start, t_end) in zip(subheadings, title_ranges):
-            start_idx = int(subheading.get("block_start", 0))
-            if education_range and education_range[0] <= start_idx < education_range[1]:
-                continue
-            original_title = str(subheading.get("title", ""))
-            company = str(subheading.get("company", ""))
-            role_frame = _call_openai_role_frame(
-                job_description=job_description,
-                job_analysis=job_analysis,
-                company=company,
-                original_title=original_title,
-                existing_bullets=existing_bullets,
-                risk_level=risk_level,
-            )
-            updated_title = role_frame.get("updated_title", original_title).strip()
-            original_raw = _latex_template[t_start:t_end]
-            replaced_title = _format_title_replacement(original_raw, updated_title)
-            updated_title_meta.append(
-                {
-                    "id": str(subheading.get("id", "")),
-                    "company": company,
-                    "original_title": original_title,
-                    "updated_title": updated_title,
-                    "role_summary": role_frame.get("role_summary", "").strip(),
-                }
-            )
-            title_replacements.append((t_start, t_end, replaced_title))
-
-        role_context: Optional[Dict[str, str]] = None
-        if updated_title_meta:
-            first = updated_title_meta[0]
-            role_context = {
-                "updated_title": first.get("updated_title", ""),
-                "role_summary": first.get("role_summary", ""),
-                "job_archetype": str(job_analysis.get("role_archetype", "")).strip(),
-            }
-        results = _call_openai(job_description, slots, role_context=role_context, risk_level=risk_level)
-        slot_by_id = {s.id: s for s in slots}
-        res_by_id = {}
-        for r in results:
-            original = slot_by_id.get(r.id).text if r.id in slot_by_id else r.updated_text
-            sanitized = _sanitize_latex_bullet(r.updated_text)
-            res_by_id[r.id] = _escape_latex(sanitized if sanitized.strip() else original)
+        experiences = _parse_experience_groups(baseline)
+        projects = _parse_project_groups(baseline)
 
         replacements: List[Tuple[int, int, str]] = []
-        replacements.extend(title_replacements)
-        for slot, (start, end) in zip(slots, ranges):
-            new_text = res_by_id.get(slot.id, slot.text)
-            replacements.append((start, end, new_text))
+        updated_title_meta: List[Dict[str, str]] = []
+        bullets_edited = 0
 
-        skills = _parse_latex_skills_section(_latex_template)
+        rewritten_experiences = rewritten.get("experiences", [])
+        if not isinstance(rewritten_experiences, list):
+            rewritten_experiences = []
+
+        for idx, exp in enumerate(experiences):
+            updated_exp = rewritten_experiences[idx] if idx < len(rewritten_experiences) else {}
+            updated_title = str(updated_exp.get("title", "")).strip() or str(exp.get("title", "")).strip()
+            t_start, t_end = exp.get("title_range", (0, 0))
+            original_raw = baseline[t_start:t_end]
+            replacements.append((t_start, t_end, _format_title_replacement(original_raw, updated_title)))
+            updated_title_meta.append(
+                {
+                    "id": str(exp.get("experience_id", "")),
+                    "company": str(exp.get("company", "")),
+                    "original_title": str(exp.get("title", "")),
+                    "updated_title": updated_title,
+                    "role_summary": "",
+                }
+            )
+
+            updated_bullets = updated_exp.get("bullets", [])
+            if not isinstance(updated_bullets, list):
+                updated_bullets = []
+            for b_idx, bullet in enumerate(exp.get("bullets", [])):
+                start, end = bullet.get("range", (0, 0))
+                original = str(bullet.get("text", "")).strip()
+                candidate = original
+                if b_idx < len(updated_bullets) and isinstance(updated_bullets[b_idx], str):
+                    cleaned = updated_bullets[b_idx].replace("\n", " ").strip()
+                    cleaned = _replace_unicode_artifacts(cleaned)
+                    cleaned = _truncate_preserve_words(cleaned, 135)
+                    sanitized = _sanitize_latex_bullet(cleaned)
+                    candidate = sanitized if sanitized.strip() else original
+                escaped = _escape_latex(candidate)
+                replacements.append((start, end, escaped))
+                bullets_edited += 1
+
+        rewritten_projects = rewritten.get("projects", [])
+        if not isinstance(rewritten_projects, list):
+            rewritten_projects = []
+        for idx, proj in enumerate(projects):
+            updated_proj = rewritten_projects[idx] if idx < len(rewritten_projects) else {}
+            updated_bullets = updated_proj.get("bullets", [])
+            if not isinstance(updated_bullets, list):
+                updated_bullets = []
+            for b_idx, bullet in enumerate(proj.get("bullets", [])):
+                start, end = bullet.get("range", (0, 0))
+                original = str(bullet.get("text", "")).strip()
+                candidate = original
+                if b_idx < len(updated_bullets) and isinstance(updated_bullets[b_idx], str):
+                    cleaned = updated_bullets[b_idx].replace("\n", " ").strip()
+                    cleaned = _replace_unicode_artifacts(cleaned)
+                    cleaned = _truncate_preserve_words(cleaned, 135)
+                    sanitized = _sanitize_latex_bullet(cleaned)
+                    candidate = sanitized if sanitized.strip() else original
+                escaped = _escape_latex(candidate)
+                replacements.append((start, end, escaped))
+                bullets_edited += 1
+
+        skills = _parse_latex_skills_section(baseline)
         skills_updated = False
         audit_skills_text = ""
+        skills_text = str(rewritten.get("skills", "") or "").strip()
         if skills:
             s_start, s_end, s_text = skills
-            updated_skills_raw = _call_openai_skills(job_description, s_text)
-            updated_skills = _escape_latex_text_keep_commands(_sanitize_latex_content(s_text, updated_skills_raw))
-            replacements.append((s_start, s_end, updated_skills))
+            candidate = skills_text or s_text
+            candidate = candidate.replace("\n", " ").strip()
+            candidate = _format_skills_headings(candidate)
+            sanitized = _sanitize_latex_content(s_text, candidate)
+            escaped = _escape_latex_text_keep_commands(sanitized)
+            replacements.append((s_start, s_end, escaped))
             skills_updated = True
-            audit_skills_text = updated_skills
-        elif skills is None:
-            audit_skills_text = ""
+            audit_skills_text = escaped
 
-        audit_title = role_context.get("updated_title", "") if role_context else ""
-        rewritten_bullets = [res_by_id.get(s.id, s.text) for s in slots]
-        audit = _call_openai_audit(audit_title, rewritten_bullets, audit_skills_text)
-
-        updated_latex = _apply_replacements(_latex_template, replacements)
-        global _last_compiled_latex, _last_optimized_latex
+        updated_latex = _apply_replacements(baseline, replacements)
         _last_compiled_latex = updated_latex
         _last_optimized_latex = updated_latex
-        global _last_bullet_ranges, _last_template_fingerprint
         try:
-            updated_grouped = _parse_latex_resume_items(updated_latex, keyword_hint)
-            updated_slots, updated_ranges = _flatten_latex_bullets(updated_grouped)
+            updated_experiences = _parse_experience_groups(updated_latex)
         except HTTPException:
-            updated_slots, updated_ranges = slots, ranges
-        _last_bullet_ranges = {
-            s.id: (r[0], r[1], s.experience_id) for s, r in zip(updated_slots, updated_ranges)
-        }
+            updated_experiences = experiences
+        _last_bullet_ranges = {}
+        for exp in updated_experiences:
+            for bullet in exp.get("bullets", []):
+                bid = str(bullet.get("id", ""))
+                start, end = bullet.get("range", (0, 0))
+                _last_bullet_ranges[bid] = (start, end, str(exp.get("experience_id", "")))
         _last_template_fingerprint = hash(updated_latex)
         pdf_bytes = _compile_latex_to_pdf_bytes(updated_latex)
 
         import base64
+        draft_bullets: List[Dict[str, str]] = []
+        for exp in updated_experiences:
+            exp_id = str(exp.get("experience_id", ""))
+            for bullet in exp.get("bullets", []):
+                draft_bullets.append(
+                    {
+                        "id": str(bullet.get("id", "")),
+                        "text": str(bullet.get("text", "")).strip(),
+                        "experience_id": exp_id,
+                    }
+                )
         payload = {
             "tex_base64": base64.b64encode(updated_latex.encode("utf-8")).decode("utf-8"),
             "pdf_base64": base64.b64encode(pdf_bytes).decode("utf-8"),
             "pdf_available": True,
-            "bullets_edited": len(results),
-            "keyword_hints": keyword_hint,
+            "bullets_edited": bullets_edited,
+            "keyword_hints": [],
             "skills_updated": skills_updated,
             "updated_titles": updated_title_meta,
-            "audit": audit,
             "locked_sections": ["Education"],
             "draft": {
                 "titles": [{"id": t.get("id", ""), "text": t.get("updated_title", "")} for t in updated_title_meta],
-                "bullets": [
-                    {
-                        "id": s.id,
-                        "text": res_by_id.get(s.id, s.text),
-                        "experience_id": s.experience_id,
-                    }
-                    for s in slots
-                ],
+                "bullets": draft_bullets,
                 "skills": audit_skills_text,
             },
         }
@@ -1610,6 +1972,7 @@ async def apply_draft_edits(payload: DraftApplyRequest):
             raise HTTPException(status_code=400, detail=f"Bullet experience_id mismatch for {bid}.")
         text = edit.text
         cleaned = text.replace("\n", " ").strip()
+        cleaned = _replace_unicode_artifacts(cleaned)
         if len(cleaned) > 180:
             raise HTTPException(status_code=400, detail="Bullet edits must be <= 180 characters.")
         sanitized = _sanitize_latex_bullet(cleaned)
@@ -1621,6 +1984,7 @@ async def apply_draft_edits(payload: DraftApplyRequest):
             raise HTTPException(status_code=400, detail="Skills section not found in this LaTeX template.")
         s_start, s_end, s_text = skills
         candidate = skills_edit.replace("\n", " ").strip()
+        candidate = _format_skills_headings(candidate)
         sanitized = _sanitize_latex_content(s_text, candidate)
         escaped = _escape_latex_text_keep_commands(sanitized)
         replacements.append((s_start, s_end, escaped))
