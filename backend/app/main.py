@@ -1166,57 +1166,6 @@ def _call_openai_full_resume_rewrite(job_description: str, resume_text: str) -> 
         "skills": skills.strip(),
     }
 
-def _call_openai_skills(job_description: str, skills_text: str) -> str:
-    if client is None:
-        raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set in backend/.env")
-    if not skills_text.strip():
-        return skills_text
-
-    instructions = (
-        "You are a resume skills section optimizer.\n"
-        "Goal: update the skills section to better match the job description.\n"
-        "Rules (STRICT):\n"
-        "1) Return JSON ONLY: {\"skills_text\":\"...\"}\n"
-        "2) You MAY add missing skills and keywords aggressively when relevant.\n"
-        "3) Preserve the existing structure (labels and separators) but you can reorder within each label.\n"
-        "4) Do NOT introduce new LaTeX commands.\n"
-        "5) Keep it concise and ATS-friendly.\n"
-        "6) Ensure proper LaTeX escaping for special characters.\n"
-    )
-
-    payload = {
-        "job_description": job_description,
-        "skills_text": skills_text,
-    }
-
-    resp = client.chat.completions.create(
-        model=OPENAI_MODEL,
-        messages=[
-            {"role": "system", "content": instructions},
-            {"role": "user", "content": json.dumps(payload)},
-        ],
-        response_format={"type": "json_object"},
-        temperature=0.3,
-    )
-
-    text = (resp.choices[0].message.content or "").strip()
-    if not text:
-        return skills_text
-
-    try:
-        data = json.loads(text)
-    except Exception:
-        m = re.search(r"\{.*\}", text, re.DOTALL)
-        if not m:
-            return skills_text
-        data = json.loads(m.group(0))
-
-    updated = data.get("skills_text")
-    if not isinstance(updated, str) or not updated.strip():
-        return skills_text
-    return updated.strip()
-
-
 def _call_openai_greeting(job_description: str) -> str:
     if client is None:
         raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set in backend/.env")
@@ -1853,7 +1802,7 @@ async def optimize(
         skills_text = str(rewritten.get("skills", "") or "").strip()
         if skills:
             s_start, s_end, s_text = skills
-            candidate = skills_text or s_text
+            candidate = skills_text
             candidate = candidate.replace("\n", " ").strip()
             candidate = _format_skills_headings(candidate)
             sanitized = _sanitize_latex_content(s_text, candidate)
