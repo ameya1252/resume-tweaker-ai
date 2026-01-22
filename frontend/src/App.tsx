@@ -381,33 +381,47 @@ export default function App() {
       <OptimizeProgressOverlay active={loading} />
       <div className="glow" />
       <div className="container">
-        <div className="step-tabs">
-          <button
-            className={`chip ${uiStep === 'input' ? 'active' : ''}`}
-            onClick={() => setUiStep('input')}
-          >
-            Input
-          </button>
-          <button
-            className={`chip ${uiStep === 'edit' ? 'active' : ''}`}
-            onClick={() => setUiStep('edit')}
-            disabled={!draft}
-          >
-            Edit
-          </button>
-          <button
-            className={`chip ${uiStep === 'export' ? 'active' : ''}`}
-            onClick={() => setUiStep('export')}
-            disabled
-          >
-            Export
-          </button>
-        </div>
+        <header className="topbar">
+          <div className="brand">
+            <div className="logo">
+              <svg viewBox="0 0 64 64" aria-hidden="true">
+                <path
+                  d="M10 36c0-12 8-22 22-22h22v8H32c-9 0-14 6-14 14s5 14 14 14h22v8H32c-14 0-22-10-22-22Z"
+                  fill="currentColor"
+                />
+                <path
+                  d="M40 14h14v14h-14z"
+                  fill="currentColor"
+                  opacity="0.6"
+                />
+              </svg>
+            </div>
+            <div>
+              <div className="brand-name">Tweakly</div>
+              <div className="brand-tag">Latency: ~30s resume tune-up</div>
+            </div>
+          </div>
+          <div className="step-tabs">
+            <button
+              className={`chip ${uiStep === 'input' ? 'active' : ''}`}
+              onClick={() => setUiStep('input')}
+            >
+              Job Brief
+            </button>
+            <button
+              className={`chip ${uiStep === 'edit' ? 'active' : ''}`}
+              onClick={() => setUiStep('edit')}
+              disabled={!draft}
+            >
+              Tune & Edit
+            </button>
+          </div>
+        </header>
         <div className="hero">
-          <div className="eyebrow">Resume Tweaker AI</div>
-          <div className="h1">Tweak your resume to the job in minutes.</div>
+          <div className="eyebrow">Nerdy. Precise. Fast.</div>
+          <div className="h1">Tune your resume in ~30 seconds, minus the fluff.</div>
           <p className="p">
-            Paste a job description, upload your LaTeX template, and get a tailored version that keeps the layout intact.
+            Feed it a job description, point it at your template, and ship a tuned version with your layout preserved.
           </p>
         </div>
 
@@ -485,7 +499,7 @@ export default function App() {
 
               <div className="actions">
                 <button className="btn primary" disabled={!canOptimize || loading} onClick={handleOptimize}>
-                  {loading ? 'Optimizing…' : 'Optimize'}
+                  {loading ? 'Tuning…' : 'Tweak in 30s'}
                 </button>
               </div>
 
@@ -635,6 +649,13 @@ export default function App() {
             />
           </div>
         )}
+
+        <footer className="footer">
+          <div className="footer-title">Built for people who geek out on clean signal.</div>
+          <div className="footer-copy">
+            Tweakly is your resume co-processor: fast iterations, minimal noise, maximal clarity.
+          </div>
+        </footer>
       </div>
     </div>
   )
