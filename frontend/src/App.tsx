@@ -42,7 +42,7 @@ export default function App() {
   const [loading, setLoading] = useState(false)
   const [coverLoading, setCoverLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const [uiStep, setUiStep] = useState<'input' | 'edit' | 'export'>('input')
+  const [uiStep, setUiStep] = useState<'input' | 'edit' | 'outreach' | 'export'>('input')
   const editPanelRef = useRef<HTMLDivElement | null>(null)
 
   const [texB64, setTexB64] = useState<string | null>(null)
@@ -52,9 +52,17 @@ export default function App() {
   const [keywordHints, setKeywordHints] = useState<string[]>([])
   const [coverLetterText, setCoverLetterText] = useState<string>('')
   const [pdfUrl, setPdfUrl] = useState<string>('')
+  const [outreachPreview, setOutreachPreview] = useState<{
+    target_roles: string[]
+    linkedin_searches: Array<{ label: string; url: string }>
+    outreach_message: string
+  } | null>(null)
+  const [outreachLoading, setOutreachLoading] = useState(false)
+  const [outreachError, setOutreachError] = useState<string | null>(null)
   const [draft, setDraft] = useState<Draft | null>(null)
   const [updatedTitles, setUpdatedTitles] = useState<Array<{ id: string; company?: string }>>([])
   const previewRef = useRef<HTMLDivElement | null>(null)
+  const outreachKeyRef = useRef<string>('')
 
   const canOptimize = useMemo(() => {
     if (mode === 'gdocs') {
@@ -93,6 +101,22 @@ export default function App() {
     return buildDraftExperiences(draft.titles || [], draft.bullets || [], companyByTitleId)
   }, [draft, companyByTitleId])
 
+  const resumeText = useMemo(() => {
+    if (!draft) return ''
+    const parts: string[] = []
+    for (const exp of draftExperiences) {
+      const title = exp.title ? ` - ${exp.title}` : ''
+      parts.push(`${exp.company || 'Company'}${title}`)
+      for (const b of exp.bullets) {
+        parts.push(`- ${b.text}`)
+      }
+    }
+    if (draft.skills) {
+      parts.push(`Skills: ${draft.skills}`)
+    }
+    return parts.join('\n').trim()
+  }, [draft, draftExperiences])
+
 
   const estimatedPdfPages = useMemo(() => {
     if (!pdfB64) return 0
@@ -112,6 +136,31 @@ export default function App() {
     }, 0)
     return () => window.clearTimeout(id)
   }, [uiStep, draft])
+
+  useEffect(() => {
+    if (uiStep !== 'outreach' || !draft) return
+    if (!jobDescription.trim() || !resumeText.trim()) return
+    const key = `${jobDescription.trim()}::${resumeText.trim()}`
+    if (outreachKeyRef.current === key && outreachPreview) return
+
+    outreachKeyRef.current = key
+    setOutreachLoading(true)
+    setOutreachError(null)
+    axios.post(`${BACKEND_URL}/outreach/preview`, {
+      job_description: jobDescription,
+      resume_text: resumeText,
+    }).then((res) => {
+      setOutreachPreview(res.data)
+    }).catch((e: any) => {
+      const msg =
+        e?.response?.data?.detail ||
+        e?.message ||
+        'Could not generate outreach preview.'
+      setOutreachError(String(msg))
+    }).finally(() => {
+      setOutreachLoading(false)
+    })
+  }, [uiStep, draft, jobDescription, resumeText])
 
 
   async function handleApplyDraft(
@@ -415,6 +464,13 @@ export default function App() {
             >
               Tune & Edit
             </button>
+            <button
+              className={`chip ${uiStep === 'outreach' ? 'active' : ''}`}
+              onClick={() => setUiStep('outreach')}
+              disabled={!draft}
+            >
+              Outreach
+            </button>
           </div>
         </header>
         <div className="hero">
@@ -647,6 +703,62 @@ export default function App() {
               value={coverLetterText}
               onChange={(e) => setCoverLetterText(e.target.value)}
             />
+          </div>
+        )}
+
+        {uiStep === 'outreach' && (
+          <div className="panel cover-panel">
+            <div className="preview-head">
+              <div className="h2">Outreach Intelligence</div>
+              <div className="small subtle">
+                Identify who to reach out to and what to say based on this job.
+              </div>
+            </div>
+            {outreachLoading && (
+              <div className="small subtle">Generating outreach ideas…</div>
+            )}
+            {outreachError && (
+              <div className="error">
+                <b>Error:</b> {outreachError}
+              </div>
+            )}
+            {!outreachLoading && !outreachError && outreachPreview && (
+              <div className="outreach-grid">
+                <div className="outreach-card">
+                  <div className="h3">Who to reach out to</div>
+                  <ul className="outreach-list">
+                    {outreachPreview.target_roles.map((role, idx) => (
+                      <li key={`${role}-${idx}`}>{role}</li>
+                    ))}
+                  </ul>
+                </div>
+                <div className="outreach-card">
+                <div className="h3">How to find them</div>
+                  <ul className="outreach-list">
+                    {outreachPreview.linkedin_searches.map((search, idx) => (
+                      <li key={`${search.url}-${idx}`}>
+                        <a href={search.url} target="_blank" rel="noreferrer">
+                          {search.label}
+                        </a>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+                <div className="outreach-card">
+                <div className="h3">What to say</div>
+                  <div className="outreach-messages">
+                    <div className="outreach-message">
+                      {outreachPreview.outreach_message}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
+            {!outreachLoading && !outreachError && !outreachPreview && (
+              <div className="muted-box">
+                Coming next: target roles, LinkedIn search hints, and outreach messages.
+              </div>
+            )}
           </div>
         )}
 

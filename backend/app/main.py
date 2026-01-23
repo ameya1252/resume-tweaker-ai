@@ -6,6 +6,7 @@ import re
 import subprocess
 import tempfile
 from typing import Dict, List, Optional, Tuple
+from urllib.parse import quote
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
@@ -189,6 +190,11 @@ class GoogleCoverLetterRequest(BaseModel):
     resume_doc_id: str
     cover_doc_id: str
     job_description: str
+
+
+class OutreachPreviewRequest(BaseModel):
+    job_description: str
+    resume_text: str
 
 
 class LatexTemplateRequest(BaseModel):
@@ -1096,6 +1102,281 @@ def _call_openai_cover_letter_body(job_description: str, resume_text: str) -> st
     return cover_letter.strip()
 
 
+def _call_openai_outreach_preview(job_description: str, resume_text: str) -> Dict[str, object]:
+    if client is None:
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set in backend/.env")
+    if not resume_text.strip():
+        raise HTTPException(status_code=400, detail="Resume text is empty; cannot generate outreach preview.")
+
+    job_title = _extract_job_title(job_description)
+    target_roles = _build_target_roles(job_title)
+    company = _extract_company_hint(job_description)
+    linkedin_searches = _call_openai_linkedin_queries(job_description)
+    outreach_message = _call_openai_outreach_message(job_description, job_title, company)
+
+    return {
+        "target_roles": target_roles,
+        "linkedin_searches": linkedin_searches,
+        "outreach_message": outreach_message,
+    }
+
+
+def _build_linkedin_searches(search_queries: List[str]) -> List[Dict[str, str]]:
+    searches: List[Dict[str, str]] = []
+    for query in search_queries:
+        label = query.strip()
+        if not label:
+            continue
+        url = f"https://www.linkedin.com/search/results/people/?keywords={quote(label)}"
+        searches.append({"label": label, "url": url})
+    return searches
+
+
+def _call_openai_linkedin_queries(job_description: str) -> List[Dict[str, str]]:
+    if client is None:
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set in backend/.env")
+    instructions = (
+        "You generate LinkedIn PEOPLE search queries for job outreach.\n"
+        "\n"
+        "Return JSON ONLY:\n"
+        "{\n"
+        "  \"queries\": [\n"
+        "    { \"label\": \"...\", \"keywords\": \"...\" }\n"
+        "  ]\n"
+        "}\n"
+        "\n"
+        "Rules (STRICT):\n"
+        "- Generate 4–6 queries\n"
+        "- Queries must return REAL PEOPLE on LinkedIn\n"
+        "- NO quotes\n"
+        "- NO site: or Google-only operators\n"
+        "- Max ~6 words per query\n"
+        "- Prefer: job title + company and/or team\n"
+        "- Do NOT over-specify technologies\n"
+        "- Company name is optional but encouraged\n"
+        "- If team/org is present in JD, include it"
+    )
+    payload = {"job_description": job_description}
+    resp = client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=[
+            {"role": "system", "content": instructions},
+            {"role": "user", "content": json.dumps(payload)},
+        ],
+        response_format={"type": "json_object"},
+        temperature=0.2,
+    )
+    text = (resp.choices[0].message.content or "").strip()
+    if not text:
+        raise HTTPException(status_code=500, detail="OpenAI returned empty output.")
+    try:
+        data = json.loads(text)
+    except Exception:
+        m = re.search(r"\{.*\}", text, re.DOTALL)
+        if not m:
+            raise HTTPException(status_code=500, detail=f"Could not parse OpenAI JSON output. Raw: {text[:400]}")
+        data = json.loads(m.group(0))
+
+    queries = data.get("queries")
+    if not isinstance(queries, list):
+        queries = []
+
+    searches: List[Dict[str, str]] = []
+    for entry in queries:
+        if not isinstance(entry, dict):
+            continue
+        label = str(entry.get("label") or "").strip()
+        keywords = str(entry.get("keywords") or "").strip()
+        if not label or not keywords:
+            continue
+        url = f"https://www.linkedin.com/search/results/people/?keywords={quote(keywords)}"
+        searches.append({"label": label, "url": url})
+        if len(searches) >= 6:
+            break
+
+    if searches:
+        return searches
+
+    job_title = _extract_job_title(job_description)
+    company = _extract_company_hint(job_description)
+    fallback_roles = _build_target_roles(job_title)[:4]
+    fallback_queries = []
+    for role in fallback_roles:
+        parts = [company, role] if company else [role]
+        query = " ".join([p for p in parts if p]).strip()
+        if query:
+            fallback_queries.append(query)
+    return _build_linkedin_searches(fallback_queries)
+
+
+def _extract_job_title(job_description: str) -> str:
+    patterns = [
+        r"(?im)^\s*(job\s*title|title|role|position)\s*[:\-]\s*(.+)$",
+        r"(?im)^\s*([A-Z][A-Za-z0-9 /,&\-]{2,60}Engineer)\s*$",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, job_description)
+        if m:
+            candidate = m.group(m.lastindex or 0).strip()
+            candidate = re.sub(r"\s+", " ", candidate)
+            if candidate:
+                return candidate
+    known_titles = [
+        "Software Engineer",
+        "Internal Tools Engineer",
+        "Full Stack Engineer",
+        "Platform Engineer",
+        "Backend Engineer",
+    ]
+    for title in known_titles:
+        if re.search(rf"(?i)\b{re.escape(title)}\b", job_description):
+            return title
+    return "Software Engineer"
+
+
+def _extract_company_hint(job_description: str) -> Optional[str]:
+    patterns = [
+        r"(?im)^\s*company\s*[:\-]\s*(.+)$",
+        r"(?im)^\s*about\s+([A-Z][\w&.,\- ]{2,60})$",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, job_description)
+        if m:
+            candidate = re.sub(r"\s+", " ", m.group(1).strip())
+            if 2 <= len(candidate) <= 60:
+                return candidate
+    m = re.search(r"(?i)\b(?:at|for)\s+([A-Z][A-Za-z0-9&.,\- ]{2,60})", job_description)
+    if m:
+        candidate = re.sub(r"\s+", " ", m.group(1).strip())
+        return candidate[:60]
+    return None
+
+
+def _extract_location_hint(job_description: str) -> Optional[str]:
+    patterns = [
+        r"(?im)^\s*location\s*[:\-]\s*([A-Za-z][A-Za-z ,.-]{2,40})$",
+        r"(?im)\bbased in\s+([A-Za-z][A-Za-z ,.-]{2,40})",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, job_description)
+        if m:
+            candidate = re.sub(r"\s+", " ", m.group(1).strip())
+            if 2 <= len(candidate) <= 40:
+                return candidate
+    return None
+
+
+def _build_target_roles(job_title: str) -> List[str]:
+    roles = [
+        "Software Engineer",
+        "Internal Tools Engineer",
+        "Full Stack Engineer",
+        "Platform Engineer",
+        "Backend Engineer",
+    ]
+    target_roles: List[str] = []
+    if job_title and job_title.lower() not in {r.lower() for r in roles}:
+        target_roles.append(job_title)
+    for role in roles:
+        if role not in target_roles:
+            target_roles.append(role)
+        if len(target_roles) >= 6:
+            break
+    return target_roles[:6]
+
+
+def _build_deterministic_linkedin_searches(
+    job_description: str,
+    target_roles: List[str],
+) -> List[Dict[str, str]]:
+    company = _extract_company_hint(job_description)
+    location = _extract_location_hint(job_description)
+
+    queries: List[str] = []
+    for role in target_roles:
+        role_words = role.split()
+        max_words = 6
+        words: List[str] = []
+        if company:
+            company_words = company.split()
+            keep_company = max(0, max_words - len(role_words))
+            if keep_company > 0:
+                words.extend(company_words[:keep_company])
+        words.extend(role_words)
+        query = " ".join(words).strip()
+        if query and query not in queries:
+            queries.append(query)
+        if len(queries) >= 6:
+            break
+
+    if company and location and len(queries) < 6:
+        company_token = company.split()[0]
+        location_words = location.split()
+        role_words = target_roles[0].split() if target_roles else ["Software", "Engineer"]
+        max_words = 6
+        remaining = max_words - len(role_words) - 1
+        words = [company_token] + role_words + location_words[:max(0, remaining)]
+        loc_query = " ".join(words).strip()
+        if loc_query and loc_query not in queries:
+            queries.append(loc_query)
+
+    return _build_linkedin_searches(queries[:6])
+
+
+def _call_openai_outreach_message(
+    job_description: str,
+    job_title: str,
+    company: Optional[str],
+) -> str:
+    if client is None:
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set in backend/.env")
+    instructions = (
+        "You write ONE concise LinkedIn outreach message using a proven cold outreach style.\n"
+        "\n"
+        "Return JSON ONLY:\n"
+        "{ \"outreach_message\": \"...\" }\n"
+        "\n"
+        "Rules (STRICT):\n"
+        "- EXACTLY one message\n"
+        "- 3–4 sentences max, under 70 words\n"
+        "- Direct and confident (founder-style)\n"
+        "- Start with: “Hi {Name} — I just applied for the {Job Title} role…”\n"
+        "- Briefly state what I build (from resume + JD overlap)\n"
+        "- Briefly state why this role/company resonates (from JD)\n"
+        "- End with a soft, low-pressure close (“Would love to chat if helpful.”)\n"
+        "- No emojis, no fluff, no markdown"
+    )
+    payload = {
+        "job_description": job_description,
+        "job_title": job_title,
+        "company": company or "",
+    }
+    resp = client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=[
+            {"role": "system", "content": instructions},
+            {"role": "user", "content": json.dumps(payload)},
+        ],
+        response_format={"type": "json_object"},
+        temperature=0.2,
+    )
+    text = (resp.choices[0].message.content or "").strip()
+    if not text:
+        raise HTTPException(status_code=500, detail="OpenAI returned empty output.")
+    try:
+        data = json.loads(text)
+    except Exception:
+        m = re.search(r"\{.*\}", text, re.DOTALL)
+        if not m:
+            raise HTTPException(status_code=500, detail=f"Could not parse OpenAI JSON output. Raw: {text[:400]}")
+        data = json.loads(m.group(0))
+
+    message = data.get("outreach_message")
+    if not isinstance(message, str) or not message.strip():
+        raise HTTPException(status_code=500, detail="OpenAI returned invalid outreach_message.")
+    return message.strip()
+
+
 def _call_openai_full_resume_rewrite(job_description: str, resume_text: str) -> Dict[str, object]:
     if client is None:
         raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set in backend/.env")
@@ -1959,3 +2240,9 @@ async def coverletter(
     resume_text = _extract_latex_text(_latex_template)
     cover_letter = _call_openai_cover_letter(job_description, resume_text)
     return {"cover_letter": cover_letter}
+
+
+@app.post("/outreach/preview")
+def outreach_preview(req: OutreachPreviewRequest):
+    preview = _call_openai_outreach_preview(req.job_description, req.resume_text)
+    return preview

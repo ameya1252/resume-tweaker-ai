@@ -144,6 +144,7 @@ textarea, input, button{font-family:inherit;}
 }
 .h1{font-size:36px; font-weight:600; letter-spacing:-0.02em; margin:0 0 10px;}
 .h2{font-size:18px; font-weight:600; margin:0;}
+.h3{font-size:15px; font-weight:600; margin:0 0 10px;}
 .p{opacity:.9; margin:0 0 14px; line-height:1.5; max-width:700px;}
 .label{font-size:12px; color:var(--muted); margin:0 0 8px;}
 .panel{
@@ -416,6 +417,53 @@ textarea, input, button{font-family:inherit;}
 .ta-cover{
   min-height:180px;
   margin-top:12px;
+}
+.muted-box{
+  margin-top:12px;
+  padding:14px;
+  border-radius:12px;
+  background: rgba(20, 26, 36, 0.7);
+  border:1px dashed #2a3345;
+  color:var(--muted);
+  font-size:13px;
+}
+.outreach-grid{
+  display:grid;
+  gap:14px;
+  margin-top:12px;
+}
+@media(min-width:960px){
+  .outreach-grid{
+    grid-template-columns:repeat(3, minmax(0, 1fr));
+  }
+}
+.outreach-card{
+  background: rgba(12, 16, 24, 0.7);
+  border:1px solid #232c3d;
+  border-radius:14px;
+  padding:14px;
+  min-height:160px;
+}
+.outreach-list{
+  margin:0;
+  padding-left:16px;
+  color:#cfd6e6;
+  font-size:13px;
+  line-height:1.4;
+}
+.outreach-messages{
+  display:flex;
+  flex-direction:column;
+  gap:10px;
+}
+.outreach-message{
+  border-radius:12px;
+  padding:10px 12px;
+  background: rgba(18, 22, 32, 0.9);
+  border:1px dashed #2b3548;
+  color:#dbe3f2;
+  font-size:13px;
+  line-height:1.4;
 }
 .preview{
   background:#ffffff;
