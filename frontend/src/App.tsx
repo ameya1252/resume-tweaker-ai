@@ -715,7 +715,25 @@ export default function App() {
               </div>
             </div>
             {outreachLoading && (
-              <div className="small subtle">Generating outreach ideas…</div>
+              <div className="outreach-loader">
+                <div className="terminal">
+                  <div className="terminal-head">
+                    <span className="terminal-dot red" />
+                    <span className="terminal-dot yellow" />
+                    <span className="terminal-dot green" />
+                    <span className="terminal-title">outreach://preview</span>
+                  </div>
+                  <div className="terminal-body">
+                    <div className="terminal-line">Scanning job context…</div>
+                    <div className="terminal-line">Synthesizing roles + signals…</div>
+                    <div className="terminal-line">Building LinkedIn searches…</div>
+                    <div className="terminal-line">Drafting outreach note…</div>
+                    <div className="terminal-line">
+                      Ready in seconds<span className="terminal-cursor">█</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
             )}
             {outreachError && (
               <div className="error">

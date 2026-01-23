@@ -1124,10 +1124,11 @@ def _call_openai_outreach_preview(job_description: str, resume_text: str) -> Dic
         raise HTTPException(status_code=400, detail="Resume text is empty; cannot generate outreach preview.")
 
     job_title = _extract_job_title(job_description)
-    target_roles = _build_target_roles(job_title)
+    target_roles = _build_target_roles(job_title, job_description)
     company = _extract_company_hint(job_description)
-    linkedin_searches = _call_openai_linkedin_queries(job_description)
-    outreach_message = _call_openai_outreach_message(job_description, job_title, company)
+    team = _extract_team_hint(job_description)
+    linkedin_searches = _call_openai_linkedin_queries(job_description, company, team)
+    outreach_message = _call_openai_outreach_message(job_description, job_title, company, resume_text)
 
     return {
         "target_roles": target_roles,
@@ -1147,7 +1148,11 @@ def _build_linkedin_searches(search_queries: List[str]) -> List[Dict[str, str]]:
     return searches
 
 
-def _call_openai_linkedin_queries(job_description: str) -> List[Dict[str, str]]:
+def _call_openai_linkedin_queries(
+    job_description: str,
+    company: Optional[str],
+    team: Optional[str],
+) -> List[Dict[str, str]]:
     if client is None:
         raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set in backend/.env")
     instructions = (
@@ -1171,7 +1176,11 @@ def _call_openai_linkedin_queries(job_description: str) -> List[Dict[str, str]]:
         "- Company name is optional but encouraged\n"
         "- If team/org is present in JD, include it"
     )
-    payload = {"job_description": job_description}
+    payload = {
+        "job_description": job_description,
+        "company": company or "",
+        "team": team or "",
+    }
     resp = client.chat.completions.create(
         model=OPENAI_MODEL,
         messages=[
@@ -1213,8 +1222,7 @@ def _call_openai_linkedin_queries(job_description: str) -> List[Dict[str, str]]:
         return searches
 
     job_title = _extract_job_title(job_description)
-    company = _extract_company_hint(job_description)
-    fallback_roles = _build_target_roles(job_title)[:4]
+    fallback_roles = _build_target_roles(job_title, job_description)[:4]
     fallback_queries = []
     for role in fallback_roles:
         parts = [company, role] if company else [role]
@@ -1267,104 +1275,83 @@ def _extract_company_hint(job_description: str) -> Optional[str]:
     return None
 
 
-def _extract_location_hint(job_description: str) -> Optional[str]:
+def _extract_team_hint(job_description: str) -> Optional[str]:
     patterns = [
-        r"(?im)^\s*location\s*[:\-]\s*([A-Za-z][A-Za-z ,.-]{2,40})$",
-        r"(?im)\bbased in\s+([A-Za-z][A-Za-z ,.-]{2,40})",
+        r"(?im)(?:join|on|within)\s+(?:the\s+)?([A-Z][A-Za-z0-9\s&-]{2,30})\s+team",
+        r"(?im)([A-Z][A-Za-z0-9\s&-]{2,30})\s+(?:team|org|organization|group)",
     ]
     for pattern in patterns:
         m = re.search(pattern, job_description)
         if m:
-            candidate = re.sub(r"\s+", " ", m.group(1).strip())
-            if 2 <= len(candidate) <= 40:
-                return candidate
+            candidate = m.group(1).strip()
+            candidate = re.sub(r"\s+", " ", candidate)
+            return candidate
     return None
 
 
-def _build_target_roles(job_title: str) -> List[str]:
-    roles = [
-        "Software Engineer",
-        "Internal Tools Engineer",
-        "Full Stack Engineer",
-        "Platform Engineer",
-        "Backend Engineer",
-    ]
+def _build_target_roles(job_title: str, job_description: str) -> List[str]:
     target_roles: List[str] = []
-    if job_title and job_title.lower() not in {r.lower() for r in roles}:
+    if job_title:
         target_roles.append(job_title)
-    for role in roles:
+
+    jd_lower = job_description.lower()
+    role_patterns = [
+        ("internal tools", "Internal Tools Engineer"),
+        ("platform", "Platform Engineer"),
+        ("full stack", "Full Stack Engineer"),
+        ("fullstack", "Full Stack Engineer"),
+        ("backend", "Backend Engineer"),
+        ("frontend", "Frontend Engineer"),
+        ("data engineer", "Data Engineer"),
+        ("devops", "DevOps Engineer"),
+        ("sre", "Site Reliability Engineer"),
+        ("infrastructure", "Infrastructure Engineer"),
+    ]
+    for keyword, role in role_patterns:
+        if keyword in jd_lower and role not in target_roles:
+            target_roles.append(role)
+        if len(target_roles) >= 6:
+            break
+
+    fallback = ["Software Engineer", "Full Stack Engineer", "Backend Engineer"]
+    for role in fallback:
         if role not in target_roles:
             target_roles.append(role)
         if len(target_roles) >= 6:
             break
+
     return target_roles[:6]
-
-
-def _build_deterministic_linkedin_searches(
-    job_description: str,
-    target_roles: List[str],
-) -> List[Dict[str, str]]:
-    company = _extract_company_hint(job_description)
-    location = _extract_location_hint(job_description)
-
-    queries: List[str] = []
-    for role in target_roles:
-        role_words = role.split()
-        max_words = 6
-        words: List[str] = []
-        if company:
-            company_words = company.split()
-            keep_company = max(0, max_words - len(role_words))
-            if keep_company > 0:
-                words.extend(company_words[:keep_company])
-        words.extend(role_words)
-        query = " ".join(words).strip()
-        if query and query not in queries:
-            queries.append(query)
-        if len(queries) >= 6:
-            break
-
-    if company and location and len(queries) < 6:
-        company_token = company.split()[0]
-        location_words = location.split()
-        role_words = target_roles[0].split() if target_roles else ["Software", "Engineer"]
-        max_words = 6
-        remaining = max_words - len(role_words) - 1
-        words = [company_token] + role_words + location_words[:max(0, remaining)]
-        loc_query = " ".join(words).strip()
-        if loc_query and loc_query not in queries:
-            queries.append(loc_query)
-
-    return _build_linkedin_searches(queries[:6])
 
 
 def _call_openai_outreach_message(
     job_description: str,
     job_title: str,
     company: Optional[str],
+    resume_text: str,
 ) -> str:
     if client is None:
         raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set in backend/.env")
     instructions = (
-        "You write ONE concise LinkedIn outreach message using a proven cold outreach style.\n"
+        "You write ONE concise LinkedIn outreach message.\n"
         "\n"
         "Return JSON ONLY:\n"
         "{ \"outreach_message\": \"...\" }\n"
         "\n"
         "Rules (STRICT):\n"
-        "- EXACTLY one message\n"
-        "- 3–4 sentences max, under 70 words\n"
-        "- Direct and confident (founder-style)\n"
-        "- Start with: “Hi {Name} — I just applied for the {Job Title} role…”\n"
-        "- Briefly state what I build (from resume + JD overlap)\n"
-        "- Briefly state why this role/company resonates (from JD)\n"
-        "- End with a soft, low-pressure close (“Would love to chat if helpful.”)\n"
-        "- No emojis, no fluff, no markdown"
+        "- 3-4 sentences max, under 70 words\n"
+        "- Start with: \"Hi {Name} —\" (keep {Name} as placeholder)\n"
+        "- Mention you applied for the specific role\n"
+        "- Reference 1-2 relevant experiences from the resume that match the JD\n"
+        "- Show genuine interest in the company/team (not generic)\n"
+        "- End with low-pressure ask (\"Would love to chat\" or \"Happy to share more\")\n"
+        "- No emojis, no fluff, no markdown, no bullet points\n"
+        "- Sound human, not templated\n"
     )
     payload = {
         "job_description": job_description,
         "job_title": job_title,
         "company": company or "",
+        "resume_text": resume_text,
     }
     resp = client.chat.completions.create(
         model=OPENAI_MODEL,
