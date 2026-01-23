@@ -612,6 +612,13 @@ def _replace_unicode_artifacts(text: str) -> str:
     )
 
 
+def _strip_trailing_dashes(text: str) -> str:
+    """Remove trailing em dashes, en dashes, hyphens, and pipes from skill lines."""
+    cleaned = re.sub(r"\s*[—–\-|]+\s*$", "", text)
+    cleaned = re.sub(r"\s*[—–\-|]\s*[—–\-|]*\s*$", "", cleaned)
+    return cleaned.strip()
+
+
 def _format_skills_headings(text: str) -> str:
     normalized = text.replace("\\\\", " ").replace("\n", " ")
     normalized = re.sub(r"\s+", " ", normalized).strip()
@@ -619,17 +626,18 @@ def _format_skills_headings(text: str) -> str:
     pattern = re.compile(r"([A-Za-z][A-Za-z0-9/&\-\s]*?:)")
     matches = list(pattern.finditer(normalized))
     if not matches:
-        return text.strip()
+        return _strip_trailing_dashes(text.strip())
 
     lines: List[str] = []
     prefix = normalized[:matches[0].start()].strip()
     if prefix:
-        lines.append(prefix)
+        lines.append(_strip_trailing_dashes(prefix))
     for i, m in enumerate(matches):
         heading = m.group(1).strip()
         start = m.end()
         end = matches[i + 1].start() if i + 1 < len(matches) else len(normalized)
         content = normalized[start:end].strip()
+        content = _strip_trailing_dashes(content)
         if not content:
             continue
         lines.append(f"\\textbf{{{heading}}} {content}")
@@ -857,6 +865,13 @@ def _sanitize_latex_bullet(candidate: str) -> str:
     """
     cleaned = re.sub(r"\\[A-Za-z]+", "", candidate)
     cleaned = cleaned.replace("\\", "")
+    cleaned = re.sub(r"\bw/\b", "with", cleaned)
+    # Replace < and its corrupted forms with "under"
+    cleaned = cleaned.replace("Â¡", "under ")
+    cleaned = cleaned.replace("¡", "under ")
+    cleaned = re.sub(r'<\s*', 'under ', cleaned)
+    # Also handle > while we're at it
+    cleaned = re.sub(r'>\s*', 'over ', cleaned)
     return cleaned
 
 
@@ -1395,7 +1410,14 @@ def _call_openai_full_resume_rewrite(job_description: str, resume_text: str) -> 
         "  ],\n"
         "  \"skills\": \"...\"\n"
         "}\n"
-        "No extra keys. No markdown."
+        "No extra keys. No markdown.\n"
+        "\n"
+        "SKILLS RULES (STRICT):\n"
+        "- Format skills as 3-5 lines maximum\n"
+        "- Use format: Category: item1, item2, item3\n"
+        "- NO trailing dashes, pipes, or em dashes after items\n"
+        "- NO '—' or '|' at the end of any line\n"
+        "- Separate categories with ' \\\\ ' (LaTeX line break)\n"
     )
 
     user_content = (
