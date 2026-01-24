@@ -441,6 +441,10 @@ export default function App() {
     axios.get(`${BACKEND_URL}/latex/template`).then((res) => {
       if (!active) return
       setHasTemplate(!!res.data?.has_template)
+      const template = res.data?.latex_template
+      if (typeof template === 'string' && template.trim()) {
+        setLatexText(template)
+      }
     }).catch(() => {
       if (!active) return
       setHasTemplate(false)

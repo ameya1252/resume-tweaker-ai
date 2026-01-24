@@ -1749,7 +1749,11 @@ def get_latex_template(
         .order_by(Resume.created_at.desc())
         .first()
     )
-    return {"has_template": bool(resume and resume.latex_template)}
+    return {
+        "has_template": bool(resume and resume.latex_template),
+        "latex_template": resume.latex_template if resume and resume.latex_template else "",
+        "name": resume.name if resume else "",
+    }
 
 
 @app.get("/latex/last")
