@@ -800,36 +800,6 @@ def _parse_latex_skills_section(latex_text: str) -> Optional[Tuple[int, int, str
     return (section_start, section_end, text)
 
 
-def _flatten_latex_bullets(grouped: List[Dict[str, object]]) -> Tuple[List[Slot], List[Tuple[int, int]]]:
-    slots: List[Slot] = []
-    ranges: List[Tuple[int, int]] = []
-    for group in grouped:
-        bullets = group.get("bullets", [])
-        for b in bullets:
-            slot = b.get("slot")
-            if isinstance(slot, Slot):
-                slots.append(slot)
-            else:
-                txt = str(b.get("text", "")).strip()
-                if not txt:
-                    continue
-                base_max = min(max(len(txt) + 6, 30), 140)
-                max_chars = max(len(txt), base_max)
-                slot = Slot(
-                    id=str(b.get("id", f"li{len(slots)}")),
-                    text=txt,
-                    original_text=txt,
-                    role_id=f"latex_role_{len(slots) // 10}",
-                    slot_type="bullet",
-                    max_chars=max_chars,
-                    keywords_required=[],
-                    experience_id=str(group.get("experience_id", "")),
-                )
-                slots.append(slot)
-            rng = b.get("range")
-            if isinstance(rng, tuple) and len(rng) == 2:
-                ranges.append((int(rng[0]), int(rng[1])))
-    return slots, ranges
 
 
 def _escape_latex(text: str) -> str:
@@ -998,12 +968,6 @@ def _extract_google_doc_text(doc: dict) -> str:
     return "\n".join(parts)
 
 
-def _google_doc_body_range(doc: dict) -> Tuple[int, int]:
-    content = doc.get("body", {}).get("content", [])
-    if not content:
-        return (1, 1)
-    end_index = content[-1].get("endIndex", 1)
-    return (1, max(1, end_index - 1))
 
 
 def _google_cover_body_range(doc: dict) -> Tuple[int, int]:
@@ -1581,221 +1545,6 @@ def _call_openai(
     return results
 
 
-def _call_openai_role_frame(
-    job_description: str,
-    job_analysis: Dict[str, object],
-    company: str,
-    original_title: str,
-    existing_bullets: List[str],
-    risk_level: str,
-) -> Dict[str, str]:
-    if client is None:
-        raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set in backend/.env")
-
-    instructions = (
-        "You create a role frame for a resume experience.\n"
-        "Return JSON ONLY: {\"updated_title\":\"...\",\"role_summary\":\"...\"}\n"
-        "Rules (STRICT):\n"
-        "1) Do NOT inflate seniority; keep level realistic for the role.\n"
-        "2) Preserve the truth of the role.\n"
-        "3) Optimize title for ATS + recruiter clarity.\n"
-        "4) Use job archetype keywords when relevant.\n"
-        "5) updated_title must remain realistic (no \"Senior\" if intern).\n"
-        "6) role_summary describes scope, not achievements.\n"
-        "7) role_summary must be <= 200 characters.\n"
-        "8) Apply the requested risk_level to title changes and reframing; do NOT change seniority.\n"
-    )
-    payload = {
-        "job_description": job_description,
-        "job_analysis": job_analysis,
-        "company": company,
-        "original_title": original_title,
-        "existing_bullets": existing_bullets,
-        "risk_level": risk_level,
-    }
-
-    resp = client.chat.completions.create(
-        model=OPENAI_MODEL,
-        messages=[
-            {"role": "system", "content": instructions},
-            {"role": "user", "content": json.dumps(payload)},
-        ],
-        response_format={"type": "json_object"},
-        temperature=0.2,
-    )
-
-    text = (resp.choices[0].message.content or "").strip()
-    if not text:
-        raise HTTPException(status_code=500, detail="OpenAI returned empty output.")
-    try:
-        data = json.loads(text)
-    except Exception:
-        m = re.search(r"\{.*\}", text, re.DOTALL)
-        if not m:
-            raise HTTPException(status_code=500, detail=f"Could not parse OpenAI JSON output. Raw: {text[:400]}")
-        data = json.loads(m.group(0))
-
-    updated_title = data.get("updated_title")
-    role_summary = data.get("role_summary")
-
-    if not isinstance(role_summary, str) or not role_summary.strip():
-        raise HTTPException(status_code=500, detail="OpenAI returned invalid role_summary.")
-    role_summary = role_summary.strip()
-    if len(role_summary) > 200:
-        truncated = role_summary[:200]
-        role_summary = truncated.rsplit(" ", 1)[0] or truncated
-
-    updated_title_valid = isinstance(updated_title, str) and updated_title.strip()
-    if updated_title_valid:
-        updated_title = updated_title.strip()
-        if len(updated_title) > 80:
-            updated_title_valid = False
-        else:
-            seniority = str(job_analysis.get("seniority", "")).strip().lower()
-            lowered = updated_title.lower()
-            if seniority in {"intern", "entry"} and any(
-                kw in lowered for kw in ["senior", "lead", "principal", "staff", "manager", "director", "vp", "head"]
-            ):
-                updated_title_valid = False
-
-    if not updated_title_valid:
-        updated_title = original_title.strip()
-
-    return {
-        "updated_title": updated_title,
-        "role_summary": role_summary,
-    }
-
-
-def _call_openai_audit(
-    updated_title: str,
-    rewritten_bullets: List[str],
-    skills_section: str,
-) -> Dict[str, List[str]]:
-    if client is None:
-        raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set in backend/.env")
-
-    instructions = (
-        "You audit resume content for risks and gaps.\n"
-        "Return JSON ONLY: {\"warnings\":[...],\"suggestions\":[...]}\n"
-        "Rules (STRICT):\n"
-        "1) No rewriting of bullets or skills.\n"
-        "2) No creativity beyond analysis of the provided text.\n"
-        "3) Warnings only if high confidence.\n"
-        "4) Suggestions must be actionable and specific (e.g., \"Add fraud signal to CampusX\").\n"
-        "5) Keep lists concise.\n"
-    )
-    payload = {
-        "updated_title": updated_title,
-        "rewritten_bullets": rewritten_bullets,
-        "skills_section": skills_section,
-    }
-
-    resp = client.chat.completions.create(
-        model=OPENAI_MODEL,
-        messages=[
-            {"role": "system", "content": instructions},
-            {"role": "user", "content": json.dumps(payload)},
-        ],
-        response_format={"type": "json_object"},
-        temperature=0.0,
-    )
-
-    text = (resp.choices[0].message.content or "").strip()
-    if not text:
-        raise HTTPException(status_code=500, detail="OpenAI returned empty output.")
-    try:
-        data = json.loads(text)
-    except Exception:
-        m = re.search(r"\{.*\}", text, re.DOTALL)
-        if not m:
-            raise HTTPException(status_code=500, detail=f"Could not parse OpenAI JSON output. Raw: {text[:400]}")
-        data = json.loads(m.group(0))
-
-    warnings = data.get("warnings")
-    suggestions = data.get("suggestions")
-
-    if not isinstance(warnings, list) or not all(isinstance(x, str) for x in warnings):
-        raise HTTPException(status_code=500, detail="OpenAI returned invalid warnings list.")
-    if not isinstance(suggestions, list) or not all(isinstance(x, str) for x in suggestions):
-        raise HTTPException(status_code=500, detail="OpenAI returned invalid suggestions list.")
-
-    return {
-        "warnings": [w.strip() for w in warnings if w.strip()],
-        "suggestions": [s.strip() for s in suggestions if s.strip()],
-    }
-
-
-def _analyze_job_description(job_description: str) -> Dict[str, object]:
-    if client is None:
-        raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set in backend/.env")
-
-    cache = _request_cache.get()
-    if cache is None:
-        cache = {}
-        _request_cache.set(cache)
-    cache_key = f"job_analysis:{job_description}"
-    cached = cache.get(cache_key)
-    if isinstance(cached, dict):
-        return cached
-
-    instructions = (
-        "You analyze a job description and return a compact hiring-signal frame.\n"
-        "Return JSON ONLY with keys:\n"
-        "role_archetype (string), seniority (\"intern\"|\"entry\"|\"mid\"|\"senior\"),\n"
-        "primary_axes (string[]), must_signal (string[]), nice_to_signal (string[]).\n"
-        "No extra keys. No markdown. No commentary."
-    )
-    payload = {"job_description": job_description}
-    resp = client.chat.completions.create(
-        model=OPENAI_MODEL,
-        messages=[
-            {"role": "system", "content": instructions},
-            {"role": "user", "content": json.dumps(payload)},
-        ],
-        response_format={"type": "json_object"},
-        temperature=0.0,
-    )
-    text = (resp.choices[0].message.content or "").strip()
-    if not text:
-        raise HTTPException(status_code=500, detail="OpenAI returned empty output.")
-    try:
-        data = json.loads(text)
-    except Exception:
-        m = re.search(r"\{.*\}", text, re.DOTALL)
-        if not m:
-            raise HTTPException(status_code=500, detail=f"Could not parse OpenAI JSON output. Raw: {text[:400]}")
-        data = json.loads(m.group(0))
-
-    if not isinstance(data, dict):
-        raise HTTPException(status_code=500, detail="OpenAI returned invalid analysis output.")
-
-    role_archetype = data.get("role_archetype")
-    seniority = data.get("seniority")
-    primary_axes = data.get("primary_axes")
-    must_signal = data.get("must_signal")
-    nice_to_signal = data.get("nice_to_signal")
-
-    if not isinstance(role_archetype, str) or not role_archetype.strip():
-        raise HTTPException(status_code=500, detail="OpenAI returned invalid role_archetype.")
-    if seniority not in {"intern", "entry", "mid", "senior"}:
-        raise HTTPException(status_code=500, detail="OpenAI returned invalid seniority.")
-    if not isinstance(primary_axes, list) or not all(isinstance(x, str) for x in primary_axes):
-        raise HTTPException(status_code=500, detail="OpenAI returned invalid primary_axes.")
-    if not isinstance(must_signal, list) or not all(isinstance(x, str) for x in must_signal):
-        raise HTTPException(status_code=500, detail="OpenAI returned invalid must_signal.")
-    if not isinstance(nice_to_signal, list) or not all(isinstance(x, str) for x in nice_to_signal):
-        raise HTTPException(status_code=500, detail="OpenAI returned invalid nice_to_signal.")
-
-    result = {
-        "role_archetype": role_archetype.strip(),
-        "seniority": seniority,
-        "primary_axes": [x.strip() for x in primary_axes if x.strip()],
-        "must_signal": [x.strip() for x in must_signal if x.strip()],
-        "nice_to_signal": [x.strip() for x in nice_to_signal if x.strip()],
-    }
-    cache[cache_key] = result
-    return result
 
 
 def _extract_latex_text(latex_text: str) -> str:
@@ -1806,8 +1555,11 @@ def _extract_latex_text(latex_text: str) -> str:
     parts: List[str] = []
     try:
         grouped = _parse_latex_resume_items(latex_text, keyword_hint)
-        slots, _ = _flatten_latex_bullets(grouped)
-        parts.extend([s.text for s in slots])
+        for group in grouped:
+            for bullet in group.get("bullets", []):
+                text = str(bullet.get("text", "")).strip()
+                if text:
+                    parts.append(text)
     except HTTPException:
         pass
     skills = _parse_latex_skills_section(latex_text)
