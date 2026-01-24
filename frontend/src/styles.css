@@ -86,9 +86,9 @@ textarea, input, button{font-family:inherit;}
 }
 .container{max-width:100%; margin:0 auto; padding:24px 24px 48px; position:relative;}
 .topbar{
-  display:flex;
+  display:grid;
+  grid-template-columns: 1fr auto 1fr;
   align-items:center;
-  justify-content:space-between;
   gap:16px;
   padding:12px 16px;
   border-radius:18px;
@@ -102,20 +102,57 @@ textarea, input, button{font-family:inherit;}
   align-items:center;
   gap:12px;
 }
+.logo-button{
+  background:transparent;
+  border:0;
+  padding:0;
+  color:inherit;
+  cursor:pointer;
+  display:inline-flex;
+}
+.logo-button:focus-visible{
+  outline:2px solid rgba(255,180,87,0.6);
+  outline-offset:4px;
+  border-radius:16px;
+}
 .logo{
-  width:44px;
-  height:44px;
-  border-radius:14px;
-  background: linear-gradient(140deg, rgba(255,180,87,0.2), rgba(91,215,197,0.15));
-  border:1px solid rgba(255,180,87,0.35);
+  width:46px;
+  height:46px;
+  border-radius:16px;
+  background: radial-gradient(circle at 20% 20%, rgba(255,209,136,0.35), transparent 60%),
+    linear-gradient(150deg, rgba(255,180,87,0.25), rgba(91,215,197,0.18));
+  border:1px solid rgba(255,180,87,0.45);
   display:flex;
   align-items:center;
   justify-content:center;
+  color:var(--text);
+  position:relative;
+  overflow:hidden;
+}
+.logo::after{
+  content:"";
+  position:absolute;
+  inset:0;
+  background: linear-gradient(120deg, rgba(255,255,255,0.22), transparent 45%);
+  opacity:0.6;
+}
+.logo-mark{
+  position:relative;
+  z-index:1;
+  font-size:22px;
+  font-weight:800;
+  letter-spacing:0.08em;
   color:var(--accent);
 }
-.logo svg{
-  width:28px;
-  height:28px;
+.logo-spark{
+  position:absolute;
+  width:18px;
+  height:18px;
+  right:-6px;
+  top:-6px;
+  border-radius:50%;
+  background: radial-gradient(circle, rgba(255,255,255,0.8), rgba(255,255,255,0));
+  opacity:0.65;
 }
 .brand-name{
   font-size:18px;
@@ -133,8 +170,59 @@ textarea, input, button{font-family:inherit;}
   gap:8px;
   align-items:center;
   flex-wrap:wrap;
+  justify-self:center;
+}
+.user-menu{
+  display:flex;
+  align-items:center;
+  justify-content:flex-end;
+  gap:10px;
+}
+.user-chip{
+  display:flex;
+  align-items:center;
+  gap:10px;
+  padding:6px 10px;
+  border-radius:999px;
+  border:1px solid #263042;
+  background:#0e131d;
+  color:var(--muted);
+  font-size:12px;
+}
+.avatar{
+  width:26px;
+  height:26px;
+  border-radius:50%;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  font-weight:700;
+  color:#121620;
+  background:linear-gradient(140deg, #ffd28f, #5bd7c5);
+}
+.user-email{
+  max-width:160px;
+  overflow:hidden;
+  text-overflow:ellipsis;
+  white-space:nowrap;
+}
+.auth-tabs{
+  display:flex;
+  justify-content:center;
+  gap:12px;
+  margin-top:16px;
+  flex-wrap:wrap;
 }
 .hero{padding:24px 4px 18px; animation:hero-enter 360ms ease;}
+.auth-stack{
+  margin-top:100px;
+  max-width:520px;
+  margin-left:auto;
+  margin-right:auto;
+}
+.auth-stack .panel{
+  margin-top:8px;
+}
 .eyebrow{
   text-transform: uppercase;
   letter-spacing: 0.2em;
@@ -166,6 +254,9 @@ textarea, input, button{font-family:inherit;}
   color:var(--text);
   outline:none;
   transition:border-color .2s ease, box-shadow .2s ease;
+}
+.ta-job{
+  min-height:340px;
 }
 .ta:focus{border-color:#2a3246; box-shadow: 0 0 0 2px rgba(215,255,122,.08);}
 .input{
@@ -232,6 +323,45 @@ textarea, input, button{font-family:inherit;}
 }
 .edit-downloads{
   flex:0 0 auto;
+}
+.saved-panel{
+  flex:0 0 auto;
+}
+.saved-list{
+  display:flex;
+  flex-direction:column;
+  gap:10px;
+  margin-top:8px;
+}
+.saved-item{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:12px;
+  padding:10px 12px;
+  border-radius:12px;
+  border:1px solid #1f2633;
+  background:#0d121b;
+}
+.saved-meta{
+  display:flex;
+  flex-direction:column;
+  gap:4px;
+  min-width:0;
+}
+.saved-name{
+  font-size:13px;
+  font-weight:600;
+  color:#e7ecf5;
+  white-space:nowrap;
+  overflow:hidden;
+  text-overflow:ellipsis;
+  max-width:260px;
+}
+.saved-actions{
+  display:flex;
+  gap:6px;
+  flex-shrink:0;
 }
 .edit-editor{
   display:flex;
@@ -311,6 +441,16 @@ textarea, input, button{font-family:inherit;}
   align-items:center;
   flex-wrap:wrap;
   margin-top:14px;
+}
+.template-actions{
+  justify-content:space-between;
+  margin-top:10px;
+}
+.template-actions-left{
+  display:flex;
+  gap:10px;
+  align-items:center;
+  flex-wrap:wrap;
 }
 .btn{
   background:#12151c;

@@ -8,12 +8,50 @@ import { buildDraftExperiences, Draft, DraftApplyRequest, DraftExperience } from
 const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || 'http://localhost:8000'
 
 type GoogleDoc = { id: string; name: string }
+type DownloadedResume = { id: string; name: string; created_at: string }
 function b64ToUint8Array(b64: string) {
   const binary = atob(b64)
   const len = binary.length
   const bytes = new Uint8Array(len)
   for (let i = 0; i < len; i++) bytes[i] = binary.charCodeAt(i)
   return bytes
+}
+
+function b64ToText(b64: string) {
+  return atob(b64)
+}
+
+function isValidEmail(value: string) {
+  const normalized = value.trim().toLowerCase()
+  if (!/^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,24}$/.test(normalized)) {
+    return false
+  }
+  const domain = normalized.split('@')[1] || ''
+  const allowedDomains = new Set([
+    'gmail.com',
+    'outlook.com',
+    'yahoo.com',
+    'icloud.com',
+    'proton.me',
+  ])
+  if (allowedDomains.has(domain)) return true
+  const tld = domain.split('.').pop() || ''
+  const allowedTlds = new Set([
+    'com',
+    'edu',
+    'org',
+    'net',
+    'in',
+    'uk',
+    'ca',
+    'au',
+    'io',
+    'ai',
+    'co',
+    'dev',
+    'tech',
+  ])
+  return allowedTlds.has(tld)
 }
 
 function downloadBytes(bytes: Uint8Array, filename: string, mime: string) {
@@ -29,6 +67,16 @@ function downloadBytes(bytes: Uint8Array, filename: string, mime: string) {
 }
 
 export default function App() {
+  const [sessionToken, setSessionToken] = useState(() => localStorage.getItem('session_token') || '')
+  const [userEmail, setUserEmail] = useState(() => localStorage.getItem('user_email') || '')
+  const [authEmail, setAuthEmail] = useState('')
+  const [authPassword, setAuthPassword] = useState('')
+  const [authLoading, setAuthLoading] = useState(false)
+  const [authError, setAuthError] = useState<string | null>(null)
+  const [downloadedResumes, setDownloadedResumes] = useState<DownloadedResume[]>([])
+  const [downloadedLoading, setDownloadedLoading] = useState(false)
+  const [downloadedError, setDownloadedError] = useState<string | null>(null)
+  const [downloadSaving, setDownloadSaving] = useState(false)
   const [jobDescription, setJobDescription] = useState('')
   const [latexFile, setLatexFile] = useState<File | null>(null)
   const [latexText, setLatexText] = useState('')
@@ -42,7 +90,7 @@ export default function App() {
   const [loading, setLoading] = useState(false)
   const [coverLoading, setCoverLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const [uiStep, setUiStep] = useState<'input' | 'edit' | 'outreach' | 'export'>('input')
+  const [uiStep, setUiStep] = useState<'input' | 'edit' | 'outreach' | 'export' | 'saved'>('input')
   const editPanelRef = useRef<HTMLDivElement | null>(null)
 
   const [texB64, setTexB64] = useState<string | null>(null)
@@ -63,6 +111,163 @@ export default function App() {
   const [updatedTitles, setUpdatedTitles] = useState<Array<{ id: string; company?: string }>>([])
   const previewRef = useRef<HTMLDivElement | null>(null)
   const outreachKeyRef = useRef<string>('')
+
+  const isAuthenticated = !!sessionToken
+  const userInitial = (userEmail.trim()[0] || 'U').toUpperCase()
+
+  useEffect(() => {
+    if (sessionToken) {
+      axios.defaults.headers.common.Authorization = `Bearer ${sessionToken}`
+    } else {
+      delete axios.defaults.headers.common.Authorization
+    }
+  }, [sessionToken])
+
+  async function handleAuth(action: 'login' | 'register') {
+    setAuthError(null)
+    setAuthLoading(true)
+    try {
+      const email = authEmail.trim()
+      if (!isValidEmail(email)) {
+        throw new Error('Enter a valid email address.')
+      }
+      if (action === 'register') {
+        await axios.post(`${BACKEND_URL}/auth/register`, {
+          email,
+          password: authPassword,
+        })
+      }
+      const res = await axios.post(`${BACKEND_URL}/auth/login`, {
+        email,
+        password: authPassword,
+      })
+      const token = res.data?.session_token
+      const returnedEmail = res.data?.email
+      if (typeof token !== 'string' || !token.trim()) {
+        throw new Error('Missing session token.')
+      }
+      localStorage.setItem('session_token', token)
+      const emailToStore = (typeof returnedEmail === 'string' && returnedEmail.trim())
+        ? returnedEmail.trim()
+        : authEmail.trim()
+      localStorage.setItem('user_email', emailToStore)
+      setSessionToken(token)
+      setUserEmail(emailToStore)
+    } catch (e: any) {
+      const msg =
+        e?.response?.data?.detail ||
+        e?.message ||
+        'Authentication failed.'
+      setAuthError(String(msg))
+    } finally {
+      setAuthLoading(false)
+    }
+  }
+
+  async function loadDownloadedResumes() {
+    setDownloadedError(null)
+    setDownloadedLoading(true)
+    try {
+      const res = await axios.get(`${BACKEND_URL}/resumes/downloaded`)
+      const items = Array.isArray(res.data?.resumes) ? res.data.resumes : []
+      setDownloadedResumes(items)
+    } catch (e: any) {
+      const msg =
+        e?.response?.data?.detail ||
+        e?.message ||
+        'Could not load saved resumes.'
+      setDownloadedError(String(msg))
+    } finally {
+      setDownloadedLoading(false)
+    }
+  }
+
+  async function saveDownloadedResume() {
+    if (!texB64 || !pdfB64 || downloadSaving) return
+    setDownloadSaving(true)
+    try {
+      const optimizedLatex = b64ToText(texB64)
+      const name = `Downloaded ${new Date().toLocaleString()}`
+      await axios.post(`${BACKEND_URL}/resumes/downloaded`, {
+        name,
+        optimized_latex: optimizedLatex,
+        pdf_base64: pdfB64,
+      })
+      await loadDownloadedResumes()
+    } catch (e: any) {
+      const msg =
+        e?.response?.data?.detail ||
+        e?.message ||
+        'Could not save downloaded resume.'
+      setError(String(msg))
+    } finally {
+      setDownloadSaving(false)
+    }
+  }
+
+  async function handleDownloadSaved(resumeId: string, kind: 'pdf' | 'tex') {
+    setError(null)
+    try {
+      const res = await axios.get(`${BACKEND_URL}/resumes/downloaded/${resumeId}`)
+      const { pdf_base64, optimized_latex, name } = res.data || {}
+      if (kind === 'pdf') {
+        if (!pdf_base64) throw new Error('No PDF found for this resume.')
+        const bytes = b64ToUint8Array(pdf_base64)
+        downloadBytes(bytes, `${name || 'resume'}.pdf`, 'application/pdf')
+      } else {
+        if (!optimized_latex) throw new Error('No LaTeX found for this resume.')
+        const bytes = new TextEncoder().encode(optimized_latex)
+        downloadBytes(bytes, `${name || 'resume'}.tex`, 'application/x-tex')
+      }
+    } catch (e: any) {
+      const msg =
+        e?.response?.data?.detail ||
+        e?.message ||
+        'Could not download saved resume.'
+      setError(String(msg))
+    }
+  }
+
+  function handleOpenSaved() {
+    setUiStep('saved')
+    if (!downloadedLoading && downloadedResumes.length === 0) {
+      loadDownloadedResumes()
+    }
+  }
+
+  function handleLogout() {
+    localStorage.removeItem('session_token')
+    localStorage.removeItem('user_email')
+    setSessionToken('')
+    setUserEmail('')
+    setJobDescription('')
+    setLatexFile(null)
+    setLatexText('')
+    setHasTemplate(false)
+    setMode('latex')
+    setSelectedDocId('')
+    setCoverDocId('')
+    setGdocsStatus(null)
+    setCoverLetterStatus(null)
+    setLoading(false)
+    setCoverLoading(false)
+    setError(null)
+    setUiStep('input')
+    setTexB64(null)
+    setPdfB64(null)
+    setPdfAvailable(false)
+    setBulletsEdited(null)
+    setKeywordHints([])
+    setCoverLetterText('')
+    setPdfUrl('')
+    setOutreachPreview(null)
+    setOutreachLoading(false)
+    setOutreachError(null)
+    setDraft(null)
+    setUpdatedTitles([])
+    setDownloadedResumes([])
+    setDownloadedError(null)
+  }
 
   const canOptimize = useMemo(() => {
     if (mode === 'gdocs') {
@@ -231,6 +436,7 @@ export default function App() {
   }
 
   useEffect(() => {
+    if (!isAuthenticated) return
     let active = true
     axios.get(`${BACKEND_URL}/latex/template`).then((res) => {
       if (!active) return
@@ -239,10 +445,11 @@ export default function App() {
       if (!active) return
       setHasTemplate(false)
     })
+    loadDownloadedResumes()
     return () => {
       active = false
     }
-  }, [])
+  }, [isAuthenticated])
 
   useEffect(() => {
     if (!pdfB64) {
@@ -409,12 +616,16 @@ export default function App() {
 
   function handleDownloadTex() {
     if (!texB64) return
+    if (pdfB64) {
+      saveDownloadedResume()
+    }
     const bytes = b64ToUint8Array(texB64)
     downloadBytes(bytes, 'resume_optimized.tex', 'application/x-tex')
   }
 
   function handleDownloadPdf() {
     if (!pdfB64) return
+    saveDownloadedResume()
     const bytes = b64ToUint8Array(pdfB64)
     downloadBytes(bytes, 'resume_optimized.pdf', 'application/pdf')
   }
@@ -425,6 +636,70 @@ export default function App() {
     downloadBytes(bytes, 'cover_letter.txt', 'text/plain')
   }
 
+  if (!isAuthenticated) {
+    return (
+      <div className="page">
+        <div className="glow" />
+        <div className="container">
+          <header className="topbar">
+            <div className="brand">
+              <div className="logo" aria-hidden="true">
+                <div className="logo-mark">T</div>
+                <div className="logo-spark" />
+              </div>
+              <div>
+                <div className="brand-name">Tweakly</div>
+                <div className="brand-tag">Sign in to start tuning.</div>
+              </div>
+            </div>
+          </header>
+          <div className="grid auth-stack">
+            <div className="panel">
+              <div className="h2">Welcome back</div>
+              <p className="p">
+                Log in to access your saved templates and tuned resumes.
+              </p>
+              <div className="label">Email</div>
+              <input
+                className="input"
+                type="email"
+                placeholder="you@domain.com"
+                value={authEmail}
+                onChange={(e) => setAuthEmail(e.target.value)}
+              />
+              <div className="label" style={{ marginTop: 12 }}>Password</div>
+              <input
+                className="input"
+                type="password"
+                placeholder="••••••••"
+                value={authPassword}
+                onChange={(e) => setAuthPassword(e.target.value)}
+              />
+              {authError && <div className="small subtle" style={{ color: '#ff9a9a', marginTop: 10 }}>{authError}</div>}
+              <div className="auth-tabs">
+                <button className="chip active" onClick={() => handleAuth('login')} disabled={authLoading}>
+                  {authLoading ? 'Signing in...' : 'Login'}
+                </button>
+                <button className="chip" onClick={() => handleAuth('register')} disabled={authLoading}>
+                  {authLoading ? 'Creating account...' : 'Register'}
+                </button>
+              </div>
+            </div>
+            <div className="panel">
+              <div className="h2">New here?</div>
+              <p className="p">
+                Create an account to keep your templates and tuned drafts attached to your profile.
+              </p>
+              <div className="small subtle">
+                Your session token is stored locally to keep you signed in.
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
   return (
     <div className="page">
       <OptimizeProgressOverlay active={loading} />
@@ -432,19 +707,12 @@ export default function App() {
       <div className="container">
         <header className="topbar">
           <div className="brand">
-            <div className="logo">
-              <svg viewBox="0 0 64 64" aria-hidden="true">
-                <path
-                  d="M10 36c0-12 8-22 22-22h22v8H32c-9 0-14 6-14 14s5 14 14 14h22v8H32c-14 0-22-10-22-22Z"
-                  fill="currentColor"
-                />
-                <path
-                  d="M40 14h14v14h-14z"
-                  fill="currentColor"
-                  opacity="0.6"
-                />
-              </svg>
-            </div>
+            <button className="logo-button" onClick={() => setUiStep('input')} type="button" aria-label="Go to home">
+              <div className="logo" aria-hidden="true">
+                <div className="logo-mark">T</div>
+                <div className="logo-spark" />
+              </div>
+            </button>
             <div>
               <div className="brand-name">Tweakly</div>
               <div className="brand-tag">Latency: ~30s resume tune-up</div>
@@ -472,6 +740,18 @@ export default function App() {
               Outreach
             </button>
           </div>
+          <div className="user-menu">
+            <button className="chip tiny" onClick={handleOpenSaved}>
+              Saved Resumes
+            </button>
+            <div className="user-chip">
+              <div className="avatar">{userInitial}</div>
+              <div className="user-email">{userEmail || 'Account'}</div>
+            </div>
+            <button className="chip tiny" onClick={handleLogout}>
+              Logout
+            </button>
+          </div>
         </header>
         <div className="hero">
           <div className="eyebrow">Nerdy. Precise. Fast.</div>
@@ -486,7 +766,7 @@ export default function App() {
             <div className="panel">
               <div className="label">Job description</div>
               <textarea
-                className="ta"
+                className="ta ta-job"
                 placeholder="Paste the job description here..."
                 value={jobDescription}
                 onChange={(e) => setJobDescription(e.target.value)}
@@ -501,9 +781,6 @@ export default function App() {
               <div className="mode-toggle">
                 <button className={`chip ${mode === 'latex' ? 'active' : ''}`} onClick={() => handleModeChange('latex')}>
                   LaTeX Template
-                </button>
-                <button className={`chip ${mode === 'gdocs' ? 'active' : ''}`} onClick={() => handleModeChange('gdocs')}>
-                  Google Docs
                 </button>
               </div>
 
@@ -522,11 +799,16 @@ export default function App() {
                     value={latexText}
                     onChange={(e) => setLatexText(e.target.value)}
                   />
-                  <div className="actions">
-                    <button className="btn" onClick={handleSaveTemplate}>
-                      Save Template
+                  <div className="actions template-actions">
+                    <div className="template-actions-left">
+                      <button className="btn" onClick={handleSaveTemplate}>
+                        Save Template
+                      </button>
+                      {hasTemplate ? <span className="badge ok">Template saved</span> : <span className="badge">No template</span>}
+                    </div>
+                    <button className="btn primary" disabled={!canOptimize || loading} onClick={handleOptimize}>
+                      {loading ? 'Tuning…' : 'Tweak in 30s'}
                     </button>
-                    {hasTemplate ? <span className="badge ok">Template saved</span> : <span className="badge">No template</span>}
                   </div>
                 </>
               ) : (
@@ -553,18 +835,17 @@ export default function App() {
                 </>
               )}
 
-              <div className="actions">
-                <button className="btn primary" disabled={!canOptimize || loading} onClick={handleOptimize}>
-                  {loading ? 'Tuning…' : 'Tweak in 30s'}
-                </button>
-              </div>
+              {mode === 'gdocs' && (
+                <div className="actions">
+                  <button className="btn primary" disabled={!canOptimize || loading} onClick={handleOptimize}>
+                    {loading ? 'Tuning…' : 'Tweak in 30s'}
+                  </button>
+                </div>
+              )}
 
               <div className="status-row">
-                {mode === 'latex' ? (
-                  pdfAvailable ? <span className="badge ok">PDF ready</span> : <span className="badge">PDF optional</span>
-                ) : (
-                  <span className="badge">Google Docs</span>
-                )}
+                {mode === 'latex' && pdfAvailable && <span className="badge ok">PDF ready</span>}
+                {mode === 'gdocs' && <span className="badge">Google Docs</span>}
                 {bulletsEdited !== null && (
                   <span className="small">
                     Edited bullets: <b>{bulletsEdited}</b>
@@ -641,6 +922,41 @@ export default function App() {
                   <div className="status-row">
                     <span className="badge warn">Estimate: Likely 2 pages</span>
                   </div>
+                )}
+              </div>
+              <div className="panel saved-panel">
+                <div className="preview-head">
+                  <div className="h2">Saved Downloads</div>
+                  <div className="small subtle">Only resumes you download are saved here.</div>
+                </div>
+                {downloadedLoading ? (
+                  <div className="small subtle">Loading saved resumes…</div>
+                ) : downloadedResumes.length === 0 ? (
+                  <div className="small subtle">No saved resumes yet.</div>
+                ) : (
+                  <div className="saved-list">
+                    {downloadedResumes.map((resume) => (
+                      <div className="saved-item" key={resume.id}>
+                        <div className="saved-meta">
+                          <div className="saved-name">{resume.name}</div>
+                          <div className="small subtle">
+                            {new Date(resume.created_at).toLocaleString()}
+                          </div>
+                        </div>
+                        <div className="saved-actions">
+                          <button className="chip tiny" onClick={() => handleDownloadSaved(resume.id, 'tex')}>
+                            .tex
+                          </button>
+                          <button className="chip tiny" onClick={() => handleDownloadSaved(resume.id, 'pdf')}>
+                            PDF
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {downloadedError && (
+                  <div className="small subtle" style={{ color: '#ff9a9a' }}>{downloadedError}</div>
                 )}
               </div>
             </div>
@@ -776,6 +1092,44 @@ export default function App() {
               <div className="muted-box">
                 Coming next: target roles, LinkedIn search hints, and outreach messages.
               </div>
+            )}
+          </div>
+        )}
+
+        {uiStep === 'saved' && (
+          <div className="panel saved-panel">
+            <div className="preview-head">
+              <div className="h2">Saved Downloads</div>
+              <div className="small subtle">Previously downloaded resumes with timestamps.</div>
+            </div>
+            {downloadedLoading ? (
+              <div className="small subtle">Loading saved resumes…</div>
+            ) : downloadedResumes.length === 0 ? (
+              <div className="small subtle">No saved resumes yet.</div>
+            ) : (
+              <div className="saved-list">
+                {downloadedResumes.map((resume) => (
+                  <div className="saved-item" key={resume.id}>
+                    <div className="saved-meta">
+                      <div className="saved-name">{resume.name}</div>
+                      <div className="small subtle">
+                        {new Date(resume.created_at).toLocaleString()}
+                      </div>
+                    </div>
+                    <div className="saved-actions">
+                      <button className="chip tiny" onClick={() => handleDownloadSaved(resume.id, 'tex')}>
+                        .tex
+                      </button>
+                      <button className="chip tiny" onClick={() => handleDownloadSaved(resume.id, 'pdf')}>
+                        PDF
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+            {downloadedError && (
+              <div className="small subtle" style={{ color: '#ff9a9a' }}>{downloadedError}</div>
             )}
           </div>
         )}

@@ -5,19 +5,29 @@ import os
 import re
 import subprocess
 import tempfile
+import uuid
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import quote
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
 from openai import OpenAI
+from passlib.context import CryptContext
 from pydantic import BaseModel, Field
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import Session as OrmSession
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+
+from db import SessionLocal
+from models import DownloadedResume, Resume
+from models import Session as SessionModel
+from models import User
 
 load_dotenv()
 
@@ -47,11 +57,6 @@ GOOGLE_SCOPES = [
 
 _google_state: Optional[str] = None
 _google_creds_data: Optional[Dict[str, str]] = None
-_latex_template: Optional[str] = None
-_last_compiled_latex: Optional[str] = None
-_last_optimized_latex: Optional[str] = None
-_last_bullet_ranges: Dict[str, Tuple[int, int, Optional[str]]] = {}
-_last_template_fingerprint: Optional[int] = None
 _request_cache: contextvars.ContextVar[Optional[Dict[str, object]]] = contextvars.ContextVar(
     "request_cache",
     default=None,
@@ -93,6 +98,12 @@ if any([GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REDIRECT_URI]):
     )
 
 app = FastAPI(title="Resume Tweaker AI (Personal)", version="0.1.0")
+
+
+@app.on_event("startup")
+def validate_database_url() -> None:
+    if not os.getenv("DATABASE_URL", "").strip():
+        raise RuntimeError("DATABASE_URL is not set. Configure it before starting the server.")
 
 _allowed_origins = [
     "http://localhost:5173",
@@ -216,6 +227,74 @@ class DraftApplyRequest(BaseModel):
     titles: Optional[List[DraftApplyItem]] = None
     bullets: Optional[List[DraftApplyItem]] = None
     skills: Optional[str] = None
+
+
+class DownloadedResumeRequest(BaseModel):
+    name: Optional[str] = None
+    optimized_latex: str
+    pdf_base64: str
+
+
+class RegisterRequest(BaseModel):
+    email: str
+    password: str
+
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+
+_pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+def hash_password(password: str) -> str:
+    return _pwd_context.hash(password)
+
+
+def verify_password(password: str, password_hash: str) -> bool:
+    return _pwd_context.verify(password, password_hash)
+
+
+def create_session_token() -> str:
+    return str(uuid.uuid4())
+
+
+def get_current_user(
+    authorization: Optional[str] = Header(None),
+    db: OrmSession = Depends(get_db),
+) -> User:
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Invalid authorization header.")
+    token = authorization.split(" ", 1)[1].strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="Invalid authorization header.")
+
+    session = db.query(SessionModel).filter(SessionModel.token == token).first()
+    if not session:
+        raise HTTPException(status_code=401, detail="Session expired or invalid.")
+    now = datetime.now(timezone.utc)
+    expires_at = session.expires_at
+    if expires_at is None:
+        raise HTTPException(status_code=401, detail="Session expired or invalid.")
+    if expires_at.tzinfo is None:
+        if expires_at <= datetime.utcnow():
+            raise HTTPException(status_code=401, detail="Session expired or invalid.")
+    elif expires_at <= now:
+        raise HTTPException(status_code=401, detail="Session expired or invalid.")
+
+    user = db.query(User).filter(User.id == session.user_id).first()
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid session.")
+    return user
 
 
 def _google_flow() -> Flow:
@@ -1607,27 +1686,101 @@ def health():
     return {"ok": True, "model": OPENAI_MODEL, "has_key": bool(OPENAI_API_KEY)}
 
 
+@app.post("/auth/register")
+def register(payload: RegisterRequest, db: OrmSession = Depends(get_db)):
+    email = payload.email.strip().lower()
+    password = payload.password.strip()
+    if not email or not password:
+        raise HTTPException(status_code=400, detail="Email and password are required.")
+    if len(password.encode("utf-8")) > 72:
+        raise HTTPException(status_code=400, detail="Password must be 72 bytes or fewer.")
+
+    existing = db.query(User).filter(User.email == email).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="Email already registered.")
+
+    user = User(email=email, password_hash=hash_password(password))
+    db.add(user)
+    try:
+        db.commit()
+    except SQLAlchemyError as exc:
+        db.rollback()
+        logger.exception("Failed to register user for email=%s", email)
+        raise HTTPException(status_code=500, detail="Could not create user.") from exc
+    db.refresh(user)
+    return {"user_id": user.id}
+
+
+@app.post("/auth/login")
+def login(payload: LoginRequest, db: OrmSession = Depends(get_db)):
+    email = payload.email.strip().lower()
+    password = payload.password.strip()
+    if not email or not password:
+        raise HTTPException(status_code=400, detail="Email and password are required.")
+    if len(password.encode("utf-8")) > 72:
+        raise HTTPException(status_code=400, detail="Password must be 72 bytes or fewer.")
+
+    user = db.query(User).filter(User.email == email).first()
+    if not user or not verify_password(password, user.password_hash):
+        raise HTTPException(status_code=401, detail="Invalid credentials.")
+
+    token = create_session_token()
+    expires_at = datetime.now(timezone.utc) + timedelta(days=7)
+    session = SessionModel(user_id=user.id, token=token, expires_at=expires_at)
+    db.add(session)
+    try:
+        db.commit()
+    except SQLAlchemyError as exc:
+        db.rollback()
+        logger.exception("Failed to create session for user_id=%s", user.id)
+        raise HTTPException(status_code=500, detail="Could not create session.") from exc
+    logger.info("User logged in: user_id=%s", user.id)
+    return {"session_token": token, "email": user.email}
+
+
 @app.get("/latex/template")
-def get_latex_template():
-    return {"has_template": bool(_latex_template)}
+def get_latex_template(
+    user: User = Depends(get_current_user),
+    db: OrmSession = Depends(get_db),
+):
+    resume = (
+        db.query(Resume)
+        .filter(Resume.user_id == user.id)
+        .order_by(Resume.created_at.desc())
+        .first()
+    )
+    return {"has_template": bool(resume and resume.latex_template)}
 
 
 @app.get("/latex/last")
-def get_last_compiled_latex():
-    if not _last_compiled_latex:
+def get_last_compiled_latex(
+    user: User = Depends(get_current_user),
+    db: OrmSession = Depends(get_db),
+):
+    resume = (
+        db.query(Resume)
+        .filter(Resume.user_id == user.id)
+        .order_by(Resume.created_at.desc())
+        .first()
+    )
+    if not resume or not resume.optimized_latex:
         raise HTTPException(status_code=404, detail="No compiled LaTeX available yet.")
-    return {"latex": _last_compiled_latex}
+    logger.info("Resume loaded: user_id=%s resume_id=%s", user.id, resume.id)
+    return {"latex": resume.optimized_latex}
 
 @app.post("/latex/template")
 async def set_latex_template(
     latex_text: str = Form(None),
     template: UploadFile = File(None),
+    user: User = Depends(get_current_user),
+    db: OrmSession = Depends(get_db),
 ):
-    global _latex_template
     content = ""
+    name = "Resume"
     if template is not None:
         if not template.filename.lower().endswith(".tex"):
             raise HTTPException(status_code=400, detail="Please upload a .tex LaTeX template.")
+        name = os.path.splitext(template.filename)[0] or name
         content = (await template.read()).decode("utf-8", errors="ignore")
     elif latex_text is not None:
         content = latex_text
@@ -1636,7 +1789,20 @@ async def set_latex_template(
         raise HTTPException(status_code=400, detail="LaTeX template content is empty.")
 
     _validate_latex_template(content)
-    _latex_template = content
+    resume = Resume(
+        user_id=user.id,
+        name=name,
+        latex_template=content,
+        optimized_latex=None,
+    )
+    db.add(resume)
+    try:
+        db.commit()
+    except SQLAlchemyError as exc:
+        db.rollback()
+        logger.exception("Failed to save resume: user_id=%s name=%s", user.id, name)
+        raise HTTPException(status_code=500, detail="Could not save resume.") from exc
+    logger.info("Resume saved: user_id=%s resume_id=%s", user.id, resume.id)
     return {"ok": True, "message": "LaTeX template saved."}
 
 @app.get("/auth/google")
@@ -1765,15 +1931,23 @@ def coverletter_google_doc(payload: GoogleCoverLetterRequest):
 async def optimize(
     job_description: str = Form(...),
     risk_level: str = Form("balanced"),
+    user: User = Depends(get_current_user),
+    db: OrmSession = Depends(get_db),
 ):
-    global _last_compiled_latex, _last_optimized_latex, _last_bullet_ranges, _last_template_fingerprint
-    if not _latex_template:
+    resume = (
+        db.query(Resume)
+        .filter(Resume.user_id == user.id)
+        .order_by(Resume.created_at.desc())
+        .first()
+    )
+    if not resume or not resume.latex_template:
         raise HTTPException(status_code=400, detail="LaTeX template not set. Upload or paste a .tex template first.")
-    _validate_latex_template(_latex_template)
+    logger.info("Resume loaded: user_id=%s resume_id=%s", user.id, resume.id)
+    _validate_latex_template(resume.latex_template)
 
     cache_token = _request_cache.set({})
     try:
-        baseline = _latex_template
+        baseline = resume.latex_template
         resume_text = _extract_resume_plain_text(baseline)
         rewritten = _call_openai_full_resume_rewrite(job_description, resume_text)
 
@@ -1859,19 +2033,17 @@ async def optimize(
             audit_skills_text = escaped
 
         updated_latex = _apply_replacements(baseline, replacements)
-        _last_compiled_latex = updated_latex
-        _last_optimized_latex = updated_latex
         try:
             updated_experiences = _parse_experience_groups(updated_latex)
         except HTTPException:
             updated_experiences = experiences
-        _last_bullet_ranges = {}
-        for exp in updated_experiences:
-            for bullet in exp.get("bullets", []):
-                bid = str(bullet.get("id", ""))
-                start, end = bullet.get("range", (0, 0))
-                _last_bullet_ranges[bid] = (start, end, str(exp.get("experience_id", "")))
-        _last_template_fingerprint = hash(updated_latex)
+        resume.optimized_latex = updated_latex
+        try:
+            db.commit()
+        except SQLAlchemyError as exc:
+            db.rollback()
+            logger.exception("Failed to save optimized resume: user_id=%s resume_id=%s", user.id, resume.id)
+            raise HTTPException(status_code=500, detail="Could not save optimized resume.") from exc
         pdf_bytes = _compile_latex_to_pdf_bytes(updated_latex)
 
         import base64
@@ -1907,11 +2079,21 @@ async def optimize(
 
 
 @app.post("/draft/apply")
-async def apply_draft_edits(payload: DraftApplyRequest):
-    global _last_compiled_latex, _last_optimized_latex
-    if not _latex_template:
+async def apply_draft_edits(
+    payload: DraftApplyRequest,
+    user: User = Depends(get_current_user),
+    db: OrmSession = Depends(get_db),
+):
+    resume = (
+        db.query(Resume)
+        .filter(Resume.user_id == user.id)
+        .order_by(Resume.created_at.desc())
+        .first()
+    )
+    if not resume or not resume.latex_template:
         raise HTTPException(status_code=400, detail="LaTeX template not set. Upload or paste a .tex template first.")
-    _validate_latex_template(_latex_template)
+    logger.info("Resume loaded: user_id=%s resume_id=%s", user.id, resume.id)
+    _validate_latex_template(resume.latex_template)
 
     title_edits = {t.id: t.text for t in (payload.titles or [])}
     bullet_edits = {b.id: b for b in (payload.bullets or [])}
@@ -1921,7 +2103,7 @@ async def apply_draft_edits(payload: DraftApplyRequest):
         raise HTTPException(status_code=400, detail="No draft edits provided.")
 
     title_map: Dict[str, Tuple[Dict[str, object], Tuple[int, int]]] = {}
-    baseline = _last_optimized_latex or _latex_template
+    baseline = resume.optimized_latex or resume.latex_template
 
     if title_edits:
         subheadings, title_ranges = _parse_latex_resume_subheadings(baseline)
@@ -1936,15 +2118,24 @@ async def apply_draft_edits(payload: DraftApplyRequest):
                         status_code=400,
                         detail="Education section is locked and cannot be edited.",
                     )
+    bullet_ranges: Dict[str, Tuple[int, int, Optional[str]]] = {}
     if bullet_edits:
-        if _last_template_fingerprint is None or _last_template_fingerprint != hash(baseline):
-            raise HTTPException(status_code=400, detail="Bullet ranges are out of date. Re-run optimize.")
-        if not _last_bullet_ranges:
+        try:
+            experiences = _parse_experience_groups(baseline)
+        except HTTPException:
+            experiences = []
+        for exp in experiences:
+            exp_id = str(exp.get("experience_id", ""))
+            for bullet in exp.get("bullets", []):
+                bid = str(bullet.get("id", ""))
+                start, end = bullet.get("range", (0, 0))
+                bullet_ranges[bid] = (start, end, exp_id)
+        if not bullet_ranges:
             raise HTTPException(status_code=400, detail="No stored bullet ranges. Re-run optimize.")
     skills = _parse_latex_skills_section(baseline)
 
     unknown_titles = [tid for tid in title_edits if tid not in title_map]
-    unknown_bullets = [bid for bid in bullet_edits if bid not in _last_bullet_ranges]
+    unknown_bullets = [bid for bid in bullet_edits if bid not in bullet_ranges]
     if unknown_titles or unknown_bullets:
         missing = ", ".join(unknown_titles + unknown_bullets)
         raise HTTPException(status_code=400, detail=f"Unknown draft ids: {missing}")
@@ -1961,7 +2152,7 @@ async def apply_draft_edits(payload: DraftApplyRequest):
 
     for bid, edit in bullet_edits.items():
         exp_id = (edit.experience_id or "").strip()
-        start, end, stored_exp = _last_bullet_ranges[bid]
+        start, end, stored_exp = bullet_ranges[bid]
         if not exp_id:
             raise HTTPException(status_code=400, detail="Bullet edits must include experience_id.")
         if stored_exp and exp_id != stored_exp:
@@ -1986,8 +2177,13 @@ async def apply_draft_edits(payload: DraftApplyRequest):
         replacements.append((s_start, s_end, escaped))
 
     updated_latex = _apply_replacements(baseline, replacements)
-    _last_compiled_latex = updated_latex
-    _last_optimized_latex = updated_latex
+    resume.optimized_latex = updated_latex
+    try:
+        db.commit()
+    except SQLAlchemyError as exc:
+        db.rollback()
+        logger.exception("Failed to save optimized resume: user_id=%s resume_id=%s", user.id, resume.id)
+        raise HTTPException(status_code=500, detail="Could not save optimized resume.") from exc
     pdf_bytes = _compile_latex_to_pdf_bytes(updated_latex)
 
     import base64
@@ -1997,13 +2193,106 @@ async def apply_draft_edits(payload: DraftApplyRequest):
     }
 
 
+@app.get("/resumes/downloaded")
+def list_downloaded_resumes(
+    user: User = Depends(get_current_user),
+    db: OrmSession = Depends(get_db),
+):
+    items = (
+        db.query(DownloadedResume)
+        .filter(DownloadedResume.user_id == user.id)
+        .order_by(DownloadedResume.created_at.desc())
+        .all()
+    )
+    return {
+        "resumes": [
+            {"id": r.id, "name": r.name, "created_at": r.created_at.isoformat()}
+            for r in items
+        ]
+    }
+
+
+@app.get("/resumes/downloaded/{resume_id}")
+def get_downloaded_resume(
+    resume_id: str,
+    user: User = Depends(get_current_user),
+    db: OrmSession = Depends(get_db),
+):
+    resume = (
+        db.query(DownloadedResume)
+        .filter(DownloadedResume.user_id == user.id, DownloadedResume.id == resume_id)
+        .first()
+    )
+    if not resume:
+        raise HTTPException(status_code=404, detail="Saved resume not found.")
+    logger.info("Downloaded resume loaded: user_id=%s resume_id=%s", user.id, resume.id)
+    return {
+        "id": resume.id,
+        "name": resume.name,
+        "latex_template": resume.latex_template,
+        "optimized_latex": resume.optimized_latex,
+        "pdf_base64": resume.pdf_base64,
+        "created_at": resume.created_at.isoformat(),
+    }
+
+
+@app.post("/resumes/downloaded")
+def save_downloaded_resume(
+    payload: DownloadedResumeRequest,
+    user: User = Depends(get_current_user),
+    db: OrmSession = Depends(get_db),
+):
+    optimized_latex = payload.optimized_latex.strip()
+    pdf_base64 = payload.pdf_base64.strip()
+    if not optimized_latex or not pdf_base64:
+        raise HTTPException(status_code=400, detail="optimized_latex and pdf_base64 are required.")
+
+    template = (
+        db.query(Resume)
+        .filter(Resume.user_id == user.id)
+        .order_by(Resume.created_at.desc())
+        .first()
+    )
+    if not template or not template.latex_template:
+        raise HTTPException(status_code=400, detail="LaTeX template not set. Upload or paste a .tex template first.")
+
+    name = (payload.name or "").strip()
+    if not name:
+        name = f"Downloaded {datetime.utcnow().strftime('%Y-%m-%d %H:%M')}"
+
+    saved = DownloadedResume(
+        user_id=user.id,
+        name=name,
+        latex_template=template.latex_template,
+        optimized_latex=optimized_latex,
+        pdf_base64=pdf_base64,
+    )
+    db.add(saved)
+    try:
+        db.commit()
+    except SQLAlchemyError as exc:
+        db.rollback()
+        logger.exception("Failed to save downloaded resume: user_id=%s", user.id)
+        raise HTTPException(status_code=500, detail="Could not save downloaded resume.") from exc
+    logger.info("Downloaded resume saved: user_id=%s resume_id=%s", user.id, saved.id)
+    return {"id": saved.id}
+
+
 @app.post("/coverletter")
 async def coverletter(
     job_description: str = Form(...),
+    user: User = Depends(get_current_user),
+    db: OrmSession = Depends(get_db),
 ):
-    if not _latex_template:
+    resume = (
+        db.query(Resume)
+        .filter(Resume.user_id == user.id)
+        .order_by(Resume.created_at.desc())
+        .first()
+    )
+    if not resume or not resume.latex_template:
         raise HTTPException(status_code=400, detail="LaTeX template not set. Upload or paste a .tex template first.")
-    resume_text = _extract_latex_text(_latex_template)
+    resume_text = _extract_latex_text(resume.latex_template)
     cover_letter = _call_openai_cover_letter(job_description, resume_text)
     return {"cover_letter": cover_letter}
 
