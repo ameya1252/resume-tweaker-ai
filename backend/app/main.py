@@ -94,14 +94,19 @@ if any([GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REDIRECT_URI]):
 
 app = FastAPI(title="Resume Tweaker AI (Personal)", version="0.1.0")
 
+_allowed_origins = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:3000",     # future-proof
+    "http://127.0.0.1:3000",
+]
+frontend_origin = os.getenv("FRONTEND_ORIGIN", "").strip()
+if frontend_origin:
+    _allowed_origins.append(frontend_origin)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "http://localhost:3000",     # future-proof
-        "http://127.0.0.1:3000",
-    ],
+    allow_origins=_allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
