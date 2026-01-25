@@ -454,8 +454,14 @@ textarea, input, button{font-family:inherit;}
   margin-top:14px;
 }
 .template-actions{
-  justify-content:space-between;
+  justify-content:center;
   margin-top:10px;
+}
+.template-header{
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+  gap:10px;
 }
 .template-actions-left{
   display:flex;
@@ -706,6 +712,21 @@ textarea, input, button{font-family:inherit;}
   text-align:center;
   color:var(--muted);
 }
+.footer-links{
+  margin-top:10px;
+  display:flex;
+  justify-content:center;
+  flex-wrap:wrap;
+  gap:12px;
+}
+.footer-link{
+  color:var(--muted);
+  text-decoration:none;
+  font-size:12px;
+}
+.footer-link:hover{
+  color:var(--text);
+}
 .footer-title{
   font-size:14px;
   font-weight:600;
@@ -715,6 +736,16 @@ textarea, input, button{font-family:inherit;}
 .footer-copy{
   font-size:12px;
   letter-spacing:0.02em;
+}
+.legal-panel .h2{
+  margin-bottom:8px;
+}
+.legal-panel .p{
+  margin-bottom:12px;
+}
+.legal-panel{
+  margin:16px auto 0;
+  max-width:900px;
 }
 
 @keyframes hero-enter{

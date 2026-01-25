@@ -170,6 +170,7 @@ export default function App() {
   const [userEmail, setUserEmail] = useState(() => localStorage.getItem('user_email') || '')
   const [userFirstName, setUserFirstName] = useState(() => localStorage.getItem('user_first_name') || '')
   const [userLastName, setUserLastName] = useState(() => localStorage.getItem('user_last_name') || '')
+  const [routePath, setRoutePath] = useState(() => window.location.pathname)
   const [authEmail, setAuthEmail] = useState('')
   const [authPassword, setAuthPassword] = useState('')
   const [authFirstName, setAuthFirstName] = useState('')
@@ -226,6 +227,23 @@ export default function App() {
       delete axios.defaults.headers.common.Authorization
     }
   }, [sessionToken])
+
+  useEffect(() => {
+    const handlePop = () => setRoutePath(window.location.pathname)
+    window.addEventListener('popstate', handlePop)
+    return () => window.removeEventListener('popstate', handlePop)
+  }, [])
+
+  function handleNavigate(path: string) {
+    if (window.location.pathname === path) return
+    window.history.pushState({}, '', path)
+    setRoutePath(path)
+  }
+
+  function handleLegalNav(nextStep: 'input' | 'edit' | 'outreach' | 'export' | 'saved') {
+    setUiStep(nextStep)
+    handleNavigate('/')
+  }
 
   async function loadUserProfile() {
     try {
@@ -684,6 +702,9 @@ export default function App() {
         return
       }
 
+      const saved = await handleSaveTemplate(false)
+      if (!saved) return
+
       const form = new FormData()
       form.append('job_description', jobDescription)
 
@@ -764,8 +785,9 @@ export default function App() {
     }
   }
 
-  async function handleSaveTemplate() {
+  async function handleSaveTemplate(showStatus = true) {
     setError(null)
+    if (!latexFile && !latexText.trim()) return false
     try {
       const form = new FormData()
       if (latexFile) {
@@ -777,13 +799,17 @@ export default function App() {
         headers: { 'Content-Type': 'multipart/form-data' },
       })
       setHasTemplate(true)
-      setGdocsStatus(res.data?.message || 'Template saved.')
+      if (showStatus) {
+        setGdocsStatus(res.data?.message || 'Template saved.')
+      }
+      return true
     } catch (e: any) {
       const msg =
         e?.response?.data?.detail ||
         e?.message ||
         'Could not save LaTeX template.'
       setError(String(msg))
+      return false
     }
   }
 
@@ -817,6 +843,106 @@ export default function App() {
 
   const savedPreview = downloadedResumes.slice(0, 1)
   const hasMoreSaved = downloadedResumes.length > 1
+
+  const isLegalRoute = routePath !== '/' && ['/privacy', '/terms', '/security', '/contact'].includes(routePath)
+
+  if (isLegalRoute) {
+    return (
+      <div className="page legal-page">
+        <div className="glow" />
+        <div className="container">
+          <header className="topbar">
+            <div className="brand">
+              <button className="logo-button" onClick={() => handleNavigate('/')} type="button" aria-label="Go to home">
+                <div className="logo" aria-hidden="true">
+                  <div className="logo-mark">T</div>
+                  <div className="logo-spark" />
+                </div>
+              </button>
+              <div>
+                <div className="brand-name">Tweakly</div>
+                <div className="brand-tag">Legal</div>
+              </div>
+            </div>
+            <div className="step-tabs">
+              <button
+                className={`chip ${uiStep === 'input' ? 'active' : ''}`}
+                onClick={() => handleLegalNav('input')}
+              >
+                Job Brief
+              </button>
+              <button
+                className={`chip ${uiStep === 'edit' ? 'active' : ''}`}
+                onClick={() => handleLegalNav('edit')}
+                disabled={!draft}
+              >
+                Tune & Edit
+              </button>
+              <button
+                className={`chip ${uiStep === 'outreach' ? 'active' : ''}`}
+                onClick={() => handleLegalNav('outreach')}
+                disabled={!draft}
+              >
+                Outreach
+              </button>
+            </div>
+            <div className="user-menu">
+              {isAuthenticated ? (
+                <>
+                  <button className="chip tiny" onClick={handleOpenSaved}>
+                    Saved Resumes
+                  </button>
+                  <div className="user-chip">
+                    <div className="avatar">{userInitial}</div>
+                    <div className="user-email">{userEmail || 'Account'}</div>
+                  </div>
+                  <button className="chip tiny" onClick={handleLogout}>
+                    Logout
+                  </button>
+                </>
+              ) : (
+                <button className="chip tiny" onClick={() => handleNavigate('/')}>
+                  Login
+                </button>
+              )}
+            </div>
+          </header>
+          <div className="panel legal-panel">
+            {routePath === '/privacy' && (
+              <>
+                <div className="h2">Privacy Policy</div>
+                <p className="p">We collect only what we need to run Tweakly: account email, resume content you upload, and usage analytics to improve the product.</p>
+                <p className="p">We do not sell your data. You can request deletion at any time by emailing support.</p>
+              </>
+            )}
+            {routePath === '/terms' && (
+              <>
+                <div className="h2">Terms of Service</div>
+                <p className="p">By using Tweakly, you agree to use the service responsibly and not upload content you don’t have rights to share.</p>
+                <p className="p">The service is provided as-is. We’re not liable for hiring outcomes or third‑party decisions.</p>
+              </>
+            )}
+            {routePath === '/security' && (
+              <>
+                <div className="h2">Security</div>
+                <p className="p">We encrypt credentials, restrict database access, and follow least‑privilege principles.</p>
+                <p className="p">If you find a vulnerability, please email us so we can fix it quickly.</p>
+              </>
+            )}
+            {routePath === '/contact' && (
+              <>
+                <div className="h2">Contact</div>
+                <p className="p">Questions or feedback? Email us at support@your-domain.com.</p>
+              </>
+            )}
+            <div className="actions">
+              <button className="btn" onClick={() => handleNavigate('/')}>Back to app</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    )
+  }
 
   if (!isAuthenticated) {
     return (
@@ -996,7 +1122,10 @@ export default function App() {
 
               {mode === 'latex' ? (
                 <>
-                  <div className="label" style={{ marginTop: 10 }}>Base resume template (.tex)</div>
+                  <div className="template-header">
+                    <div className="label" style={{ marginTop: 10 }}>Base resume template (.tex)</div>
+                    {hasTemplate ? <span className="badge ok">Template saved</span> : <span className="badge">No template</span>}
+                  </div>
                   <input
                     className="input"
                     type="file"
@@ -1010,12 +1139,6 @@ export default function App() {
                     onChange={(e) => setLatexText(e.target.value)}
                   />
                   <div className="actions template-actions">
-                    <div className="template-actions-left">
-                      <button className="btn" onClick={handleSaveTemplate}>
-                        Save Template
-                      </button>
-                      {hasTemplate ? <span className="badge ok">Template saved</span> : <span className="badge">No template</span>}
-                    </div>
                     <button className="btn primary" disabled={!canOptimize || loading} onClick={handleOptimize}>
                       {loading ? 'Tuning…' : 'Tweak in 30s'}
                     </button>
@@ -1355,6 +1478,12 @@ export default function App() {
           <div className="footer-title">Built for people who geek out on clean signal.</div>
           <div className="footer-copy">
             Tweakly is your resume co-processor: fast iterations, minimal noise, maximal clarity.
+          </div>
+          <div className="footer-links">
+            <a href="/privacy" className="footer-link" onClick={(e) => { e.preventDefault(); handleNavigate('/privacy') }}>Privacy</a>
+            <a href="/terms" className="footer-link" onClick={(e) => { e.preventDefault(); handleNavigate('/terms') }}>Terms</a>
+            <a href="/security" className="footer-link" onClick={(e) => { e.preventDefault(); handleNavigate('/security') }}>Security</a>
+            <a href="/contact" className="footer-link" onClick={(e) => { e.preventDefault(); handleNavigate('/contact') }}>Contact</a>
           </div>
         </footer>
       </div>
