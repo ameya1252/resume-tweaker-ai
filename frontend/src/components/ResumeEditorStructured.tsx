@@ -18,6 +18,8 @@ export default function ResumeEditorStructured({
   onApply,
 }: ResumeEditorStructuredProps) {
   const [bulletBlocks, setBulletBlocks] = useState<Record<string, string>>({})
+  const [titleEdits, setTitleEdits] = useState<Record<string, string>>({})
+  const [companyEdits, setCompanyEdits] = useState<Record<string, string>>({})
   const [blockWarnings, setBlockWarnings] = useState<Record<string, string>>({})
   const [saving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState<string | null>(null)
@@ -28,6 +30,14 @@ export default function ResumeEditorStructured({
       nextBlocks[exp.id] = exp.bullets.map((b) => `• ${b.text}`).join('\n')
     }
     setBulletBlocks(nextBlocks)
+    const nextTitles: Record<string, string> = {}
+    const nextCompanies: Record<string, string> = {}
+    for (const exp of draftExperiences) {
+      nextTitles[exp.id] = exp.title || ''
+      nextCompanies[exp.id] = exp.company || ''
+    }
+    setTitleEdits(nextTitles)
+    setCompanyEdits(nextCompanies)
     setBlockWarnings({})
     setSaveError(null)
   }, [draftExperiences])
@@ -55,8 +65,18 @@ export default function ResumeEditorStructured({
     setSaveError(null)
     let invalid = false
     const bulletChanges: DraftItem[] = []
+    const titleChanges: DraftItem[] = []
+    const companyChanges: DraftItem[] = []
 
     for (const exp of visibleExperiences) {
+      const nextTitle = (titleEdits[exp.id] ?? '').trim()
+      if (nextTitle !== exp.title) {
+        titleChanges.push({ id: exp.id, text: nextTitle })
+      }
+      const nextCompany = (companyEdits[exp.id] ?? '').trim()
+      if (nextCompany !== exp.company) {
+        companyChanges.push({ id: exp.id, text: nextCompany })
+      }
       const block = bulletBlocks[exp.id] ?? ''
       const lines = block
         .split('\n')
@@ -94,8 +114,10 @@ export default function ResumeEditorStructured({
 
     const changes: DraftApplyRequest = {}
     if (bulletChanges.length) changes.bullets = bulletChanges
+    if (titleChanges.length) changes.titles = titleChanges
+    if (companyChanges.length) changes.companies = companyChanges
 
-    if (!changes.bullets) return
+    if (!changes.bullets && !changes.titles && !changes.companies) return
     if (invalid) return
 
     setSaving(true)
@@ -124,8 +146,18 @@ export default function ResumeEditorStructured({
 
       {visibleExperiences.map((exp) => (
         <div key={exp.id} className="exp-editor">
-          <div className="exp-editor-company">{exp.company}</div>
-          <div className="exp-editor-title">{exp.title || 'Role'}</div>
+          <input
+            className="input exp-editor-company"
+            value={companyEdits[exp.id] ?? ''}
+            placeholder="Company"
+            onChange={(e) => setCompanyEdits((prev) => ({ ...prev, [exp.id]: e.target.value }))}
+          />
+          <input
+            className="input exp-editor-title"
+            value={titleEdits[exp.id] ?? ''}
+            placeholder="Role"
+            onChange={(e) => setTitleEdits((prev) => ({ ...prev, [exp.id]: e.target.value }))}
+          />
           <textarea
             className="ta draft-textarea"
             rows={Math.max(3, exp.bullets.length + 1)}

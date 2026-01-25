@@ -228,6 +228,7 @@ class DraftApplyItem(BaseModel):
 
 class DraftApplyRequest(BaseModel):
     titles: Optional[List[DraftApplyItem]] = None
+    companies: Optional[List[DraftApplyItem]] = None
     bullets: Optional[List[DraftApplyItem]] = None
     skills: Optional[str] = None
 
@@ -815,6 +816,7 @@ def _parse_latex_resume_subheadings(latex_text: str) -> Tuple[List[Dict[str, obj
 
         if not parse_failed and len(fields) == 4:
             title_start, title_end = field_ranges[2]
+            company_start, company_end = field_ranges[0]
             subheadings.append(
                 {
                     "id": f"lhs{len(subheadings)}",
@@ -823,6 +825,7 @@ def _parse_latex_resume_subheadings(latex_text: str) -> Tuple[List[Dict[str, obj
                     "title": fields[2],
                     "dates": fields[3],
                     "title_range": [title_start, title_end],
+                    "company_range": [company_start, company_end],
                     "block_start": start,
                     "block_end": i,
                 }
@@ -2105,6 +2108,7 @@ async def optimize(
             "locked_sections": ["Education"],
             "draft": {
                 "titles": [{"id": t.get("id", ""), "text": t.get("updated_title", "")} for t in updated_title_meta],
+                "companies": [{"id": t.get("id", ""), "text": t.get("company", "")} for t in updated_title_meta],
                 "bullets": draft_bullets,
                 "skills": audit_skills_text,
             },
@@ -2132,21 +2136,22 @@ async def apply_draft_edits(
     _validate_latex_template(resume.latex_template)
 
     title_edits = {t.id: t.text for t in (payload.titles or [])}
+    company_edits = {c.id: c.text for c in (payload.companies or [])}
     bullet_edits = {b.id: b for b in (payload.bullets or [])}
     skills_edit = payload.skills
 
-    if not title_edits and not bullet_edits and skills_edit is None:
+    if not title_edits and not company_edits and not bullet_edits and skills_edit is None:
         raise HTTPException(status_code=400, detail="No draft edits provided.")
 
     title_map: Dict[str, Tuple[Dict[str, object], Tuple[int, int]]] = {}
     baseline = resume.optimized_latex or resume.latex_template
 
-    if title_edits:
+    if title_edits or company_edits:
         subheadings, title_ranges = _parse_latex_resume_subheadings(baseline)
         title_map = {s.get("id", ""): (s, r) for s, r in zip(subheadings, title_ranges)}
         education_range = _latex_section_range(baseline, "Education")
         if education_range:
-            for tid in title_edits:
+            for tid in list(title_edits.keys()) + list(company_edits.keys()):
                 sub, _ = title_map.get(tid, ({}, (0, 0)))
                 start_idx = int(sub.get("block_start", 0)) if isinstance(sub, dict) else 0
                 if education_range[0] <= start_idx < education_range[1]:
@@ -2171,9 +2176,10 @@ async def apply_draft_edits(
     skills = _parse_latex_skills_section(baseline)
 
     unknown_titles = [tid for tid in title_edits if tid not in title_map]
+    unknown_companies = [cid for cid in company_edits if cid not in title_map]
     unknown_bullets = [bid for bid in bullet_edits if bid not in bullet_ranges]
-    if unknown_titles or unknown_bullets:
-        missing = ", ".join(unknown_titles + unknown_bullets)
+    if unknown_titles or unknown_companies or unknown_bullets:
+        missing = ", ".join(unknown_titles + unknown_companies + unknown_bullets)
         raise HTTPException(status_code=400, detail=f"Unknown draft ids: {missing}")
 
     replacements: List[Tuple[int, int, str]] = []
@@ -2183,6 +2189,18 @@ async def apply_draft_edits(
         if len(cleaned) > 200:
             raise HTTPException(status_code=400, detail="Title edits must be <= 200 characters.")
         _, (start, end) = title_map[tid]
+        original_raw = baseline[start:end]
+        replacements.append((start, end, _format_title_replacement(original_raw, cleaned)))
+
+    for cid, text in company_edits.items():
+        cleaned = text.replace("\n", " ").strip()
+        if len(cleaned) > 200:
+            raise HTTPException(status_code=400, detail="Company edits must be <= 200 characters.")
+        sub, _ = title_map[cid]
+        company_range = sub.get("company_range", [0, 0]) if isinstance(sub, dict) else [0, 0]
+        start, end = int(company_range[0]), int(company_range[1])
+        if start >= end:
+            raise HTTPException(status_code=400, detail="Could not locate company range for edit.")
         original_raw = baseline[start:end]
         replacements.append((start, end, _format_title_replacement(original_raw, cleaned)))
 

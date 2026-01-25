@@ -490,7 +490,7 @@ export default function App() {
 
   const draftExperiences: DraftExperience[] = useMemo(() => {
     if (!draft) return []
-    return buildDraftExperiences(draft.titles || [], draft.bullets || [], companyByTitleId)
+    return buildDraftExperiences(draft.titles || [], draft.bullets || [], draft.companies || [], companyByTitleId)
   }, [draft, companyByTitleId])
 
   const resumeText = useMemo(() => {
@@ -582,11 +582,19 @@ export default function App() {
   async function handleApplyChanges(changes: DraftApplyRequest) {
     if (!draft) return
     const titleById = new Map((changes.titles || []).map((t) => [t.id, t.text]))
+    const companyById = new Map((changes.companies || []).map((c) => [c.id, c.text]))
     const bulletById = new Map((changes.bullets || []).map((b) => [b.id, b.text]))
+    const baseCompanies = (draft.companies && draft.companies.length > 0)
+      ? draft.companies
+      : draft.titles.map((t) => ({ id: t.id, text: companyByTitleId[t.id] || '' }))
     const nextDraft: Draft = {
       titles: draft.titles.map((t) => ({
         ...t,
         text: titleById.has(t.id) ? String(titleById.get(t.id)) : t.text,
+      })),
+      companies: baseCompanies.map((c) => ({
+        ...c,
+        text: companyById.has(c.id) ? String(companyById.get(c.id)) : c.text,
       })),
       bullets: draft.bullets.map((b) => ({
         ...b,

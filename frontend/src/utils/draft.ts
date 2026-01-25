@@ -1,5 +1,5 @@
 export type DraftItem = { id: string; text: string; experience_id?: string | null }
-export type Draft = { titles: DraftItem[]; bullets: DraftItem[]; skills: string }
+export type Draft = { titles: DraftItem[]; companies?: DraftItem[]; bullets: DraftItem[]; skills: string }
 export type DraftExperience = {
   id: string
   company: string
@@ -8,6 +8,7 @@ export type DraftExperience = {
 }
 export type DraftApplyRequest = {
   titles?: DraftItem[]
+  companies?: DraftItem[]
   bullets?: DraftItem[]
   skills?: string
 }
@@ -15,6 +16,7 @@ export type DraftApplyRequest = {
 export function buildDraftExperiences(
   titles: DraftItem[],
   bullets: DraftItem[],
+  companies: DraftItem[] = [],
   companyById: Record<string, string> = {},
 ) {
   if (!titles.length) {
@@ -28,9 +30,13 @@ export function buildDraftExperiences(
     if (!bucketed[key]) bucketed[key] = []
     bucketed[key].push(b)
   }
+  const companyByDraft: Record<string, string> = {}
+  for (const c of companies) {
+    if (c.id) companyByDraft[c.id] = c.text
+  }
   return titles.map((t) => ({
     id: t.id,
-    company: companyById[t.id] || '',
+    company: companyByDraft[t.id] || companyById[t.id] || '',
     title: t.text,
     bullets: bucketed[t.id] || [],
   }))

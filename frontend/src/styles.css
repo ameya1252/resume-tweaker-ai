@@ -551,6 +551,12 @@ textarea, input, button{font-family:inherit;}
   font-size:14px;
   color:#e7ecf5;
 }
+.exp-editor-company.input,
+.exp-editor-title.input{
+  width:100%;
+  text-transform:none;
+  font-size:13px;
+}
 .warning-banner{
   margin:10px 0 14px;
   padding:10px 12px;
