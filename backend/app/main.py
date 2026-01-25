@@ -147,30 +147,6 @@ class OptimizeResult(BaseModel):
 class CoverLetterResult(BaseModel):
     cover_letter: str
 
-
-class RoleFrame(BaseModel):
-    experience_id: str
-    original_title: str
-    updated_title: str = Field(max_length=80)
-    role_summary: str = Field(max_length=200)
-
-FULL_RESUME_REWRITE_PROMPT = (
-    "what do i tweak in my resume to guarentee an interview at this job description.\n"
-    "make sure all the keywords are included. i am experimenting a personal project to see how well gpt performs.\n"
-    "so you can make up stuff as well if needed.\n"
-    "make sure the bullets are about the same size like the prev ones or they wont fit in there (max 135 chars).\n"
-    "make sure its in google xyz format.\n"
-    "also each line does not need to have data and more of a story of my project.\n"
-    "change the job titles as needed.\n"
-    "make sure to quantify the results as well in the bullets where needed.\n"
-    "\n"
-    "also make sure you dont forget the essence of each exp\n"
-    "like dahl lab was ultrasound lab,\n"
-    "tractor supply is a retail company,\n"
-    "campusx is a student marketplace,\n"
-    "p&g is retail and supply chain."
-)
-
 COVER_LETTER_INSTRUCTIONS = (
     "You are a cover letter writing engine.\n"
     "Goal: produce a strong, concise cover letter tailored to the job description using the resume content.\n"
@@ -1435,55 +1411,68 @@ def _call_openai_outreach_message(
     return message.strip()
 
 
-def _call_openai_full_resume_rewrite(job_description: str, resume_text: str) -> Dict[str, object]:
+def _call_openai_rewrite_bullets_only(
+    job_description: str,
+    bullets: List[Dict[str, str]],
+    risk_level: str = "maximum",
+) -> Dict[str, str]:
+    """
+    AI only rewrites bullet TEXT. Returns {id: new_text}.
+    Structure is NEVER touched.
+    """
     if client is None:
-        raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set in backend/.env")
-    if not resume_text.strip():
-        raise HTTPException(status_code=400, detail="Resume text is empty; cannot optimize.")
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set")
 
     instructions = (
-        "You rewrite an entire resume based on a job description.\n"
-        "Return JSON ONLY in this format:\n"
-        "{\n"
-        "  \"experiences\": [\n"
-        "    {\"company\":\"...\",\"title\":\"...\",\"dates\":\"...\",\"bullets\":[\"...\"]}\n"
-        "  ],\n"
-        "  \"projects\": [\n"
-        "    {\"name\":\"...\",\"bullets\":[\"...\"]}\n"
-        "  ],\n"
-        "  \"skills\": \"...\"\n"
-        "}\n"
-        "No extra keys. No markdown.\n"
+        "You are a resume bullet rewriting engine.\n"
+        "Goal: tailor resume bullets to maximize interview selection for the job description.\n"
         "\n"
-        "SKILLS RULES (STRICT):\n"
-        "- Format skills as 3-5 lines maximum\n"
-        "- Use format: Category: item1, item2, item3\n"
-        "- NO trailing dashes, pipes, or em dashes after items\n"
-        "- NO '—' or '|' at the end of any line\n"
-        "- Separate categories with ' \\\\ ' (LaTeX line break)\n"
+        "RISK LEVEL GUIDE:\n"
+        "- conservative: Minor tweaks, add 1-2 keywords, keep original meaning\n"
+        "- balanced: Moderate rewrite, add keywords, maintain core truth\n"
+        "- aggressive: Heavy rewrite, maximize keywords, stretch/exaggerate accomplishments\n"
+        "- maximum: Complete rewrite to match JD perfectly, invent plausible details if needed\n"
+        "\n"
+        f"Current risk_level: {risk_level}\n"
+        "\n"
+        "Rules (STRICT — MUST FOLLOW ALL):\n"
+        "1) Return JSON ONLY in the exact format: {\"bullets\":[{\"id\":\"...\",\"text\":\"...\"}]}. No extra text.\n"
+        "2) Return EXACTLY the same number of bullets with the SAME IDs in the SAME order.\n"
+        "3) CRITICAL: Each bullet MUST be <= 130 characters. Count carefully. This is a HARD LIMIT.\n"
+        "4) Aggressively reword to align with the job description, even if that means rewriting most of the bullet.\n"
+        "5) Start each bullet with a strong past-tense action verb.\n"
+        "6) Use Google XYZ resume style (Accomplished X by doing Y, resulting in Z).\n"
+        "7) Include ALL major job-description keywords explicitly; prefer stronger keyword density over subtlety.\n"
+        "8) Quantify results wherever plausible.\n"
+        "9) Bullets should be story-driven but compact; remove filler to make room for keywords.\n"
+        "10) Preserve the essence of each experience based on the 'context' field (e.g., lab/retail/marketplace/supply chain).\n"
+        "11) Return ONLY plain text - NO LaTeX commands, NO backslashes, NO special characters like \\textbf.\n"
+        "12) Apply the requested risk_level to keyword density and reframing; do NOT change seniority.\n"
+        "13) If a bullet cannot be improved, return the original text unchanged.\n"
+        "\n"
+        "CRITICAL: You are ONLY rewriting bullet text. Do NOT return titles, companies, dates, or any structure.\n"
     )
 
-    user_content = (
-        f"{FULL_RESUME_REWRITE_PROMPT}\n\n"
-        "RESUME:\n"
-        f"{resume_text}\n\n"
-        "JOB DESCRIPTION:\n"
-        f"{job_description}"
-    )
+    payload = {
+        "job_description": job_description,
+        "bullets": bullets,
+        "risk_level": risk_level,
+    }
 
     resp = client.chat.completions.create(
         model=OPENAI_MODEL_RESUME,
         messages=[
             {"role": "system", "content": instructions},
-            {"role": "user", "content": user_content},
+            {"role": "user", "content": json.dumps(payload)},
         ],
         response_format={"type": "json_object"},
-        temperature=0.4,
+        temperature=0.35,
     )
 
     text = (resp.choices[0].message.content or "").strip()
     if not text:
         raise HTTPException(status_code=500, detail="OpenAI returned empty output.")
+
     try:
         data = json.loads(text)
     except Exception:
@@ -1492,25 +1481,157 @@ def _call_openai_full_resume_rewrite(job_description: str, resume_text: str) -> 
             raise HTTPException(status_code=500, detail=f"Could not parse OpenAI JSON output. Raw: {text[:400]}")
         data = json.loads(m.group(0))
 
-    if not isinstance(data, dict):
-        raise HTTPException(status_code=500, detail="OpenAI returned invalid resume output.")
+    result: Dict[str, str] = {}
+    for item in data.get("bullets", []):
+        bid = str(item.get("id", "")).strip()
+        new_text = str(item.get("text", "")).replace("\n", " ").strip()
+        if bid and new_text:
+            result[bid] = new_text
 
-    experiences = data.get("experiences", [])
-    projects = data.get("projects", [])
-    skills = data.get("skills", "")
+    return result
 
-    if not isinstance(experiences, list):
-        raise HTTPException(status_code=500, detail="OpenAI returned invalid experiences list.")
-    if not isinstance(projects, list):
-        raise HTTPException(status_code=500, detail="OpenAI returned invalid projects list.")
-    if not isinstance(skills, str):
-        raise HTTPException(status_code=500, detail="OpenAI returned invalid skills text.")
 
-    return {
-        "experiences": experiences,
-        "projects": projects,
-        "skills": skills.strip(),
+def _call_openai_rewrite_titles(
+    job_description: str,
+    titles: List[Dict[str, str]],
+) -> Dict[str, str]:
+    """
+    AI rewrites job titles only. Returns {id: new_title}.
+    """
+    if client is None:
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set")
+
+    instructions = (
+        "You are a resume title optimization engine.\n"
+        "Goal: adjust job titles to better align with the target job description while staying truthful.\n"
+        "\n"
+        "Rules (STRICT):\n"
+        "1) Return JSON ONLY: {\"titles\":[{\"id\":\"...\",\"title\":\"...\"}]}\n"
+        "2) Return EXACTLY the same number of titles with the SAME IDs.\n"
+        "3) Each title MUST be <= 80 characters.\n"
+        "4) Only adjust titles if it improves alignment - don't change for no reason.\n"
+        "5) Keep titles realistic and truthful to the company/role context.\n"
+        "6) Do NOT invent seniority (don't turn 'Engineer' into 'Senior Engineer').\n"
+        "7) Return ONLY plain text - no LaTeX.\n"
+    )
+
+    payload = {
+        "job_description": job_description,
+        "titles": titles,
     }
+
+    resp = client.chat.completions.create(
+        model=OPENAI_MODEL_RESUME,
+        messages=[
+            {"role": "system", "content": instructions},
+            {"role": "user", "content": json.dumps(payload)},
+        ],
+        response_format={"type": "json_object"},
+        temperature=0.2,
+    )
+
+    text = (resp.choices[0].message.content or "").strip()
+    if not text:
+        raise HTTPException(status_code=500, detail="OpenAI returned empty output.")
+
+    try:
+        data = json.loads(text)
+    except Exception:
+        m = re.search(r"\{.*\}", text, re.DOTALL)
+        if not m:
+            raise HTTPException(status_code=500, detail=f"Could not parse OpenAI JSON output. Raw: {text[:400]}")
+        data = json.loads(m.group(0))
+
+    result: Dict[str, str] = {}
+    for item in data.get("titles", []):
+        tid = str(item.get("id", "")).strip()
+        new_title = str(item.get("title", "")).replace("\n", " ").strip()
+        if tid and new_title:
+            result[tid] = new_title
+
+    return result
+
+
+def _call_openai_rewrite_skills(
+    job_description: str,
+    current_skills: str,
+    max_chars: int = 1000,
+) -> str:
+    """
+    AI rewrites skills section. Returns new skills text.
+    """
+    if client is None:
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set")
+
+    # Count how many categories the original has
+    original_categories = len(re.findall(r"\\textbf\{[^}]+\}", current_skills))
+    if original_categories == 0:
+        original_categories = len(re.findall(r"[A-Za-z][A-Za-z\s&/]+:", current_skills))
+
+    instructions = (
+        "You are a resume skills section optimizer.\n"
+        "Goal: reorder and adjust skills to highlight those most relevant to the job description.\n"
+        "\n"
+        "Rules (STRICT):\n"
+        "1) Return JSON ONLY: {\"skills\":\"...\"}\n"
+        f"2) Skills text MUST be <= {max_chars} characters.\n"
+        f"3) Use EXACTLY {max(original_categories, 3)} category lines.\n"
+        "4) Format EACH category as: \\textbf{Category:} skill1, skill2, skill3\n"
+        "5) Separate categories with ' \\\\\\\\ ' (that's 4 backslashes for LaTeX line break).\n"
+        "6) Prioritize skills mentioned in the job description.\n"
+        "7) Do NOT invent skills the person doesn't have - only reorder/emphasize.\n"
+        "8) NO trailing dashes, pipes, or em dashes.\n"
+        "9) Each category name should NOT contain '&' - use 'and' instead.\n"
+        "10) Keep category names SHORT (1-2 words max, like 'Languages', 'Backend', 'Cloud').\n"
+        "\n"
+        "Example output format:\n"
+        "\\textbf{Languages:} Python, Java, SQL \\\\\\\\ \\textbf{Backend:} FastAPI, Redis \\\\\\\\ \\textbf{Cloud:} AWS, Docker\n"
+    )
+
+    payload = {
+        "job_description": job_description,
+        "current_skills": current_skills,
+    }
+
+    resp = client.chat.completions.create(
+        model=OPENAI_MODEL_RESUME,
+        messages=[
+            {"role": "system", "content": instructions},
+            {"role": "user", "content": json.dumps(payload)},
+        ],
+        response_format={"type": "json_object"},
+        temperature=0.2,
+    )
+
+    text = (resp.choices[0].message.content or "").strip()
+    if not text:
+        return current_skills
+
+    try:
+        data = json.loads(text)
+    except Exception:
+        m = re.search(r"\{.*\}", text, re.DOTALL)
+        if not m:
+            return current_skills
+        data = json.loads(m.group(0))
+
+    new_skills = str(data.get("skills", "")).strip()
+    if not new_skills:
+        return current_skills
+    
+    # Post-process: ensure proper line breaks
+    # Replace "& " in category names with "and "
+    new_skills = re.sub(r"\\textbf\{([^}]*?)&([^}]*?)\}", r"\\textbf{\1and\2}", new_skills)
+    
+    # Ensure \\ are present between categories
+    # If AI forgot them, add them before each \textbf{ except the first
+    if " \\\\ " not in new_skills and "\\textbf{" in new_skills:
+        parts = re.split(r"(?=\\textbf\{)", new_skills)
+        parts = [p.strip() for p in parts if p.strip()]
+        new_skills = " \\\\ ".join(parts)
+    
+    return new_skills
+
 
 def _call_openai_greeting(job_description: str) -> str:
     if client is None:
@@ -1564,7 +1685,7 @@ def _call_openai(
         "\n"
         "Rules (STRICT — MUST FOLLOW ALL):\n"
         "1) Return JSON ONLY in the exact format: {\"results\":[{\"id\":...,\"updated_text\":...}]}. No extra text.\n"
-        "2) updated_text MUST be a single line (no line breaks) and MUST be <= max_chars (max 135 chars).\n"
+        "2) updated_text MUST be a single line (no line breaks) and MUST be <= max_chars (max 130 chars).\n"
         "3) Aggressively reword to align with the job description, even if that means rewriting most of the bullet.\n"
         "4) Start each bullet with a strong past-tense action verb.\n"
         "5) Use Google XYZ resume style.\n"
@@ -1987,91 +2108,106 @@ async def optimize(
     cache_token = _request_cache.set({})
     try:
         baseline = resume.latex_template
-        resume_text = _extract_resume_plain_text(baseline)
-        rewritten = _call_openai_full_resume_rewrite(job_description, resume_text)
-
         experiences = _parse_experience_groups(baseline)
         projects = _parse_project_groups(baseline)
+        skills_parsed = _parse_latex_skills_section(baseline)
 
-        replacements: List[Tuple[int, int, str]] = []
-        updated_title_meta: List[Dict[str, str]] = []
-        bullets_edited = 0
+        bullets_for_ai: List[Dict[str, str]] = []
+        bullet_ranges: Dict[str, Tuple[int, int]] = {}
+        for exp in experiences:
+            context = f"{exp.get('company', '')} - {exp.get('title', '')}"
+            for bullet in exp.get("bullets", []):
+                bid = str(bullet.get("id", ""))
+                text = str(bullet.get("text", ""))
+                bullets_for_ai.append(
+                    {
+                        "id": bid,
+                        "text": text,
+                        "context": context,
+                        "max_chars": min(135, max(len(text) + 10, 80)),
+                    }
+                )
+                bullet_ranges[bid] = bullet.get("range", (0, 0))
 
-        rewritten_experiences = rewritten.get("experiences", [])
-        if not isinstance(rewritten_experiences, list):
-            rewritten_experiences = []
+        for idx, proj in enumerate(projects):
+            context = f"Project: {proj.get('name', '')}"
+            for b_idx, bullet in enumerate(proj.get("bullets", [])):
+                bid = f"proj_{idx}_{b_idx}"
+                text = str(bullet.get("text", ""))
+                bullets_for_ai.append(
+                    {
+                        "id": bid,
+                        "text": text,
+                        "context": context,
+                        "max_chars": min(135, max(len(text) + 10, 80)),
+                    }
+                )
+                bullet_ranges[bid] = bullet.get("range", (0, 0))
 
-        for idx, exp in enumerate(experiences):
-            updated_exp = rewritten_experiences[idx] if idx < len(rewritten_experiences) else {}
-            updated_title = str(updated_exp.get("title", "")).strip() or str(exp.get("title", "")).strip()
-            t_start, t_end = exp.get("title_range", (0, 0))
-            original_raw = baseline[t_start:t_end]
-            replacements.append((t_start, t_end, _format_title_replacement(original_raw, updated_title)))
-            updated_title_meta.append(
+        titles_for_ai: List[Dict[str, str]] = []
+        for exp in experiences:
+            exp_id = str(exp.get("experience_id", ""))
+            bullet_summary = "; ".join([str(b.get("text", ""))[:50] for b in exp.get("bullets", [])[:3]])
+            titles_for_ai.append(
                 {
-                    "id": str(exp.get("experience_id", "")),
+                    "id": exp_id,
+                    "title": str(exp.get("title", "")),
                     "company": str(exp.get("company", "")),
-                    "original_title": str(exp.get("title", "")),
-                    "updated_title": updated_title,
-                    "role_summary": "",
+                    "context": bullet_summary,
                 }
             )
 
-            updated_bullets = updated_exp.get("bullets", [])
-            if not isinstance(updated_bullets, list):
-                updated_bullets = []
-            for b_idx, bullet in enumerate(exp.get("bullets", [])):
-                start, end = bullet.get("range", (0, 0))
-                original = str(bullet.get("text", "")).strip()
-                candidate = original
-                if b_idx < len(updated_bullets) and isinstance(updated_bullets[b_idx], str):
-                    cleaned = updated_bullets[b_idx].replace("\n", " ").strip()
-                    cleaned = _replace_unicode_artifacts(cleaned)
-                    cleaned = _truncate_preserve_words(cleaned, 135)
-                    sanitized = _sanitize_latex_bullet(cleaned)
-                    candidate = sanitized if sanitized.strip() else original
-                escaped = _escape_latex(candidate)
-                replacements.append((start, end, escaped))
-                bullets_edited += 1
+        rewritten_bullets = _call_openai_rewrite_bullets_only(job_description, bullets_for_ai, risk_level)
+        rewritten_titles = _call_openai_rewrite_titles(job_description, titles_for_ai)
 
-        rewritten_projects = rewritten.get("projects", [])
-        if not isinstance(rewritten_projects, list):
-            rewritten_projects = []
-        for idx, proj in enumerate(projects):
-            updated_proj = rewritten_projects[idx] if idx < len(rewritten_projects) else {}
-            updated_bullets = updated_proj.get("bullets", [])
-            if not isinstance(updated_bullets, list):
-                updated_bullets = []
-            for b_idx, bullet in enumerate(proj.get("bullets", [])):
-                start, end = bullet.get("range", (0, 0))
-                original = str(bullet.get("text", "")).strip()
-                candidate = original
-                if b_idx < len(updated_bullets) and isinstance(updated_bullets[b_idx], str):
-                    cleaned = updated_bullets[b_idx].replace("\n", " ").strip()
-                    cleaned = _replace_unicode_artifacts(cleaned)
-                    cleaned = _truncate_preserve_words(cleaned, 135)
-                    sanitized = _sanitize_latex_bullet(cleaned)
-                    candidate = sanitized if sanitized.strip() else original
-                escaped = _escape_latex(candidate)
-                replacements.append((start, end, escaped))
-                bullets_edited += 1
+        rewritten_skills = ""
+        if skills_parsed:
+            rewritten_skills = _call_openai_rewrite_skills(job_description, skills_parsed[2])
 
-        skills = _parse_latex_skills_section(baseline)
-        skills_updated = False
-        audit_skills_text = ""
-        skills_text = str(rewritten.get("skills", "") or "").strip()
-        if skills:
-            s_start, s_end, s_text = skills
-            candidate = skills_text
-            candidate = candidate.replace("\n", " ").strip()
-            candidate = _format_skills_headings(candidate)
-            sanitized = _sanitize_latex_content(s_text, candidate)
-            escaped = _escape_latex_text_keep_commands(sanitized)
+        replacements: List[Tuple[int, int, str]] = []
+        bullets_edited = 0
+        updated_title_meta: List[Dict[str, str]] = []
+
+        for bid, (start, end) in bullet_ranges.items():
+            original = baseline[start:end]
+            new_text = rewritten_bullets.get(bid, original)
+            new_text = _sanitize_latex_bullet(new_text)
+            new_text = _escape_latex(new_text)
+            new_text = _truncate_preserve_words(new_text, 135)
+            if new_text != original:
+                bullets_edited += 1
+            replacements.append((start, end, new_text))
+
+        for exp in experiences:
+            exp_id = str(exp.get("experience_id", ""))
+            t_start, t_end = exp.get("title_range", (0, 0))
+            original_raw = baseline[t_start:t_end]
+            original_title = str(exp.get("title", ""))
+            new_title = rewritten_titles.get(exp_id, original_title)[:80]
+            replacements.append((t_start, t_end, _format_title_replacement(original_raw, new_title)))
+            updated_title_meta.append(
+                {
+                    "id": exp_id,
+                    "company": str(exp.get("company", "")),
+                    "original_title": original_title,
+                    "updated_title": new_title,
+                }
+            )
+
+        if skills_parsed and rewritten_skills:
+            s_start, s_end, s_original = skills_parsed
+            # Skip _format_skills_headings - AI formats correctly now
+            #formatted = _format_skills_headings(rewritten_skills)
+            #sanitized = _sanitize_latex_content(s_original, formatted)
+            escaped = _escape_latex_text_keep_commands(rewritten_skills)
             replacements.append((s_start, s_end, escaped))
-            skills_updated = True
-            audit_skills_text = escaped
 
-        updated_latex = _apply_replacements(baseline, replacements)
+        sorted_replacements = sorted(replacements, key=lambda x: x[0])
+        for i in range(len(sorted_replacements) - 1):
+            if sorted_replacements[i][1] > sorted_replacements[i + 1][0]:
+                raise HTTPException(status_code=500, detail="Internal error: overlapping replacements")
+
+        updated_latex = _apply_replacements(baseline, sorted_replacements)
         try:
             updated_experiences = _parse_experience_groups(updated_latex)
         except HTTPException:
@@ -2102,15 +2238,13 @@ async def optimize(
             "pdf_base64": base64.b64encode(pdf_bytes).decode("utf-8"),
             "pdf_available": True,
             "bullets_edited": bullets_edited,
-            "keyword_hints": [],
-            "skills_updated": skills_updated,
+            "keyword_hints": _extract_keywords_from_jd(job_description),
             "updated_titles": updated_title_meta,
-            "locked_sections": ["Education"],
             "draft": {
                 "titles": [{"id": t.get("id", ""), "text": t.get("updated_title", "")} for t in updated_title_meta],
                 "companies": [{"id": t.get("id", ""), "text": t.get("company", "")} for t in updated_title_meta],
                 "bullets": draft_bullets,
-                "skills": audit_skills_text,
+                "skills": rewritten_skills or (skills_parsed[2] if skills_parsed else ""),
             },
         }
         return JSONResponse(payload)
