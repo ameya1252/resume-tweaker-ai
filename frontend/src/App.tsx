@@ -66,11 +66,115 @@ function downloadBytes(bytes: Uint8Array, filename: string, mime: string) {
   URL.revokeObjectURL(url)
 }
 
+function slugify(value: string) {
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+}
+
+function cleanName(value: string, fallback: string) {
+  const cleaned = value.replace(/[^a-zA-Z0-9]+/g, '').trim()
+  return cleaned || fallback
+}
+
+function extractCompany(jobDescription: string) {
+  const lines = jobDescription.split('\n').map((line) => line.trim()).filter(Boolean)
+  for (const line of lines) {
+    const m = line.match(/^(company|company name)\s*[:\-]\s*(.+)$/i)
+    if (m) return m[2].trim()
+    const about = line.match(/^about\s+([A-Z][A-Za-z0-9&.,\- ]{2,60})$/i)
+    if (about) return about[1].trim()
+  }
+  const inline = jobDescription.match(/\b(?:at|for)\s+([A-Z][A-Za-z0-9&.,\- ]{2,60})/i)
+  return inline ? inline[1].trim() : ''
+}
+
+function extractRoleFocus(jobDescription: string) {
+  const titleLineMatch = jobDescription.match(
+    new RegExp("^\\s*(job\\s*title|title|role|position)\\s*[:\\-]\\s*(.+)$", "im")
+  )
+  const rawTitle = titleLineMatch ? titleLineMatch[2].trim() : ''
+  const titleParts = rawTitle.split(/[,|/]| - /).map((part) => part.trim()).filter(Boolean)
+  const titleCore = titleParts[0] || rawTitle
+  const titleFocus = titleParts.length > 1 ? titleParts[1] : ''
+
+  const roleMap: Array<{ match: RegExp; abbr: string }> = [
+    { match: /\bsoftware development engineer\b/i, abbr: 'sde' },
+    { match: /\bsoftware engineer\b/i, abbr: 'swe' },
+    { match: /\bdata scientist\b/i, abbr: 'ds' },
+    { match: /\bmachine learning engineer\b/i, abbr: 'mle' },
+    { match: /\bdata engineer\b/i, abbr: 'de' },
+    { match: /\bproduct manager\b/i, abbr: 'pm' },
+    { match: /\bfrontend engineer\b/i, abbr: 'fe' },
+    { match: /\bfront[-\s]?end engineer\b/i, abbr: 'fe' },
+    { match: /\bbackend engineer\b/i, abbr: 'be' },
+    { match: /\bback[-\s]?end engineer\b/i, abbr: 'be' },
+    { match: /\bfull[-\s]?stack engineer\b/i, abbr: 'fse' },
+    { match: /\bplatform engineer\b/i, abbr: 'pe' },
+    { match: /\bsite reliability engineer\b/i, abbr: 'sre' },
+    { match: /\bdevops engineer\b/i, abbr: 'devops' },
+  ]
+  const source = `${titleCore}\n${jobDescription}`
+  const role = roleMap.find((entry) => entry.match.test(source))?.abbr || ''
+
+  const focusMap: Array<{ match: RegExp; slug: string }> = [
+    { match: /\bobservability\b/i, slug: 'observability' },
+    { match: /\bmachine learning\b|\bml\b/i, slug: 'machinelearning' },
+    { match: /\bdata science\b/i, slug: 'datascience' },
+    { match: /\bdata platform\b/i, slug: 'dataplatform' },
+    { match: /\bplatform\b/i, slug: 'platform' },
+    { match: /\binfrastructure\b|\binfra\b/i, slug: 'infra' },
+    { match: /\bbackend\b/i, slug: 'backend' },
+    { match: /\bfrontend\b|\bfront[-\s]?end\b/i, slug: 'frontend' },
+    { match: /\bfull[-\s]?stack\b/i, slug: 'fullstack' },
+    { match: /\bsecurity\b/i, slug: 'security' },
+    { match: /\bdata\b/i, slug: 'data' },
+    { match: /\bai\b|\bartificial intelligence\b/i, slug: 'ai' },
+    { match: /\bnlp\b/i, slug: 'nlp' },
+  ]
+
+  const focusSource = titleFocus || jobDescription
+  const focus = focusMap.find((entry) => entry.match.test(focusSource))?.slug || ''
+
+  return { role, focus }
+}
+
+function buildDownloadBaseName(jobDescription: string, firstName: string, lastName: string) {
+  const safeFirst = cleanName(firstName || '', 'User')
+  const safeLast = cleanName(lastName || '', 'User')
+  const companySlug = slugify(extractCompany(jobDescription))
+  const { role, focus } = extractRoleFocus(jobDescription)
+  const roleSlug = [role, focus].filter(Boolean).join('_')
+
+  if (companySlug || roleSlug) {
+    const tail = [companySlug, roleSlug].filter(Boolean).join('_')
+    return `${safeFirst}_Resume_${tail || 'role'}`
+  }
+  return `${safeFirst}_${safeLast}_company_role`
+}
+
+function makeUniqueName(baseName: string, existingNames: string[]) {
+  const existing = new Set(existingNames.map((name) => name.toLowerCase()))
+  let candidate = baseName
+  let suffix = 1
+  while (existing.has(candidate.toLowerCase())) {
+    candidate = `${baseName}_${suffix}`
+    suffix += 1
+  }
+  return candidate
+}
+
 export default function App() {
   const [sessionToken, setSessionToken] = useState(() => localStorage.getItem('session_token') || '')
   const [userEmail, setUserEmail] = useState(() => localStorage.getItem('user_email') || '')
+  const [userFirstName, setUserFirstName] = useState(() => localStorage.getItem('user_first_name') || '')
+  const [userLastName, setUserLastName] = useState(() => localStorage.getItem('user_last_name') || '')
   const [authEmail, setAuthEmail] = useState('')
   const [authPassword, setAuthPassword] = useState('')
+  const [authFirstName, setAuthFirstName] = useState('')
+  const [authLastName, setAuthLastName] = useState('')
+  const [authMode, setAuthMode] = useState<'login' | 'register'>('login')
   const [authLoading, setAuthLoading] = useState(false)
   const [authError, setAuthError] = useState<string | null>(null)
   const [downloadedResumes, setDownloadedResumes] = useState<DownloadedResume[]>([])
@@ -123,18 +227,57 @@ export default function App() {
     }
   }, [sessionToken])
 
+  async function loadUserProfile() {
+    try {
+      const res = await axios.get(`${BACKEND_URL}/auth/me`)
+      const returnedEmail = res.data?.email
+      const returnedFirstName = res.data?.first_name
+      const returnedLastName = res.data?.last_name
+      if (typeof returnedEmail === 'string' && returnedEmail.trim()) {
+        const emailToStore = returnedEmail.trim()
+        localStorage.setItem('user_email', emailToStore)
+        setUserEmail(emailToStore)
+      }
+      if (typeof returnedFirstName === 'string' && returnedFirstName.trim()) {
+        const firstNameToStore = returnedFirstName.trim()
+        localStorage.setItem('user_first_name', firstNameToStore)
+        setUserFirstName(firstNameToStore)
+      }
+      if (typeof returnedLastName === 'string' && returnedLastName.trim()) {
+        const lastNameToStore = returnedLastName.trim()
+        localStorage.setItem('user_last_name', lastNameToStore)
+        setUserLastName(lastNameToStore)
+      }
+    } catch {
+      // Ignore profile fetch errors and keep local defaults.
+    }
+  }
+
+  useEffect(() => {
+    if (sessionToken) {
+      loadUserProfile()
+    }
+  }, [sessionToken])
+
   async function handleAuth(action: 'login' | 'register') {
     setAuthError(null)
     setAuthLoading(true)
     try {
       const email = authEmail.trim()
+      const firstName = authFirstName.trim()
+      const lastName = authLastName.trim()
       if (!isValidEmail(email)) {
         throw new Error('Enter a valid email address.')
       }
       if (action === 'register') {
+        if (!firstName || !lastName) {
+          throw new Error('Enter your first and last name.')
+        }
         await axios.post(`${BACKEND_URL}/auth/register`, {
           email,
           password: authPassword,
+          first_name: firstName,
+          last_name: lastName,
         })
       }
       const res = await axios.post(`${BACKEND_URL}/auth/login`, {
@@ -143,6 +286,8 @@ export default function App() {
       })
       const token = res.data?.session_token
       const returnedEmail = res.data?.email
+      const returnedFirstName = res.data?.first_name
+      const returnedLastName = res.data?.last_name
       if (typeof token !== 'string' || !token.trim()) {
         throw new Error('Missing session token.')
       }
@@ -150,9 +295,19 @@ export default function App() {
       const emailToStore = (typeof returnedEmail === 'string' && returnedEmail.trim())
         ? returnedEmail.trim()
         : authEmail.trim()
+      const firstNameToStore = (typeof returnedFirstName === 'string' && returnedFirstName.trim())
+        ? returnedFirstName.trim()
+        : authFirstName.trim()
+      const lastNameToStore = (typeof returnedLastName === 'string' && returnedLastName.trim())
+        ? returnedLastName.trim()
+        : authLastName.trim()
       localStorage.setItem('user_email', emailToStore)
+      localStorage.setItem('user_first_name', firstNameToStore)
+      localStorage.setItem('user_last_name', lastNameToStore)
       setSessionToken(token)
       setUserEmail(emailToStore)
+      setUserFirstName(firstNameToStore)
+      setUserLastName(lastNameToStore)
     } catch (e: any) {
       const msg =
         e?.response?.data?.detail ||
@@ -162,6 +317,15 @@ export default function App() {
     } finally {
       setAuthLoading(false)
     }
+  }
+
+  function handleAuthTabClick(nextMode: 'login' | 'register') {
+    if (authMode !== nextMode) {
+      setAuthMode(nextMode)
+      setAuthError(null)
+      return
+    }
+    handleAuth(nextMode)
   }
 
   async function loadDownloadedResumes() {
@@ -182,12 +346,13 @@ export default function App() {
     }
   }
 
-  async function saveDownloadedResume() {
+  async function saveDownloadedResume(nameOverride?: string) {
     if (!texB64 || !pdfB64 || downloadSaving) return
     setDownloadSaving(true)
     try {
       const optimizedLatex = b64ToText(texB64)
-      const name = `Downloaded ${new Date().toLocaleString()}`
+      const baseName = nameOverride || buildDownloadBaseName(jobDescription, userFirstName, userLastName)
+      const name = makeUniqueName(baseName, downloadedResumes.map((resume) => resume.name))
       await axios.post(`${BACKEND_URL}/resumes/downloaded`, {
         name,
         optimized_latex: optimizedLatex,
@@ -238,8 +403,12 @@ export default function App() {
   function handleLogout() {
     localStorage.removeItem('session_token')
     localStorage.removeItem('user_email')
+    localStorage.removeItem('user_first_name')
+    localStorage.removeItem('user_last_name')
     setSessionToken('')
     setUserEmail('')
+    setUserFirstName('')
+    setUserLastName('')
     setJobDescription('')
     setLatexFile(null)
     setLatexText('')
@@ -620,18 +789,24 @@ export default function App() {
 
   function handleDownloadTex() {
     if (!texB64) return
+    const baseName = buildDownloadBaseName(jobDescription, userFirstName, userLastName)
+    const uniqueBaseName = makeUniqueName(baseName, downloadedResumes.map((resume) => resume.name))
     if (pdfB64) {
-      saveDownloadedResume()
+      saveDownloadedResume(uniqueBaseName)
     }
     const bytes = b64ToUint8Array(texB64)
-    downloadBytes(bytes, 'resume_optimized.tex', 'application/x-tex')
+    const filename = `${uniqueBaseName}.tex`
+    downloadBytes(bytes, filename, 'application/x-tex')
   }
 
   function handleDownloadPdf() {
     if (!pdfB64) return
-    saveDownloadedResume()
+    const baseName = buildDownloadBaseName(jobDescription, userFirstName, userLastName)
+    const uniqueBaseName = makeUniqueName(baseName, downloadedResumes.map((resume) => resume.name))
+    saveDownloadedResume(uniqueBaseName)
     const bytes = b64ToUint8Array(pdfB64)
-    downloadBytes(bytes, 'resume_optimized.pdf', 'application/pdf')
+    const filename = `${uniqueBaseName}.pdf`
+    downloadBytes(bytes, filename, 'application/pdf')
   }
 
   function handleDownloadCoverLetter() {
@@ -674,6 +849,26 @@ export default function App() {
                 value={authEmail}
                 onChange={(e) => setAuthEmail(e.target.value)}
               />
+              {authMode === 'register' && (
+                <>
+                  <div className="label" style={{ marginTop: 12 }}>First name</div>
+                  <input
+                    className="input"
+                    type="text"
+                    placeholder="First name"
+                    value={authFirstName}
+                    onChange={(e) => setAuthFirstName(e.target.value)}
+                  />
+                  <div className="label" style={{ marginTop: 12 }}>Last name</div>
+                  <input
+                    className="input"
+                    type="text"
+                    placeholder="Last name"
+                    value={authLastName}
+                    onChange={(e) => setAuthLastName(e.target.value)}
+                  />
+                </>
+              )}
               <div className="label" style={{ marginTop: 12 }}>Password</div>
               <input
                 className="input"
@@ -684,11 +879,19 @@ export default function App() {
               />
               {authError && <div className="small subtle" style={{ color: '#ff9a9a', marginTop: 10 }}>{authError}</div>}
               <div className="auth-tabs">
-                <button className="chip active" onClick={() => handleAuth('login')} disabled={authLoading}>
-                  {authLoading ? 'Signing in...' : 'Login'}
+                <button
+                  className={`chip ${authMode === 'login' ? 'active' : ''}`}
+                  onClick={() => handleAuthTabClick('login')}
+                  disabled={authLoading}
+                >
+                  {authLoading && authMode === 'login' ? 'Signing in...' : 'Login'}
                 </button>
-                <button className="chip" onClick={() => handleAuth('register')} disabled={authLoading}>
-                  {authLoading ? 'Creating account...' : 'Register'}
+                <button
+                  className={`chip ${authMode === 'register' ? 'active' : ''}`}
+                  onClick={() => handleAuthTabClick('register')}
+                  disabled={authLoading}
+                >
+                  {authLoading && authMode === 'register' ? 'Creating account...' : 'Register'}
                 </button>
               </div>
             </div>

@@ -107,6 +107,7 @@ def validate_database_url() -> None:
     if not os.getenv("DATABASE_URL", "").strip():
         raise RuntimeError("DATABASE_URL is not set. Configure it before starting the server.")
 
+
 _allowed_origins = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
@@ -240,6 +241,8 @@ class DownloadedResumeRequest(BaseModel):
 class RegisterRequest(BaseModel):
     email: str
     password: str
+    first_name: str
+    last_name: str
 
 
 class LoginRequest(BaseModel):
@@ -1698,8 +1701,10 @@ def health():
 def register(payload: RegisterRequest, db: OrmSession = Depends(get_db)):
     email = payload.email.strip().lower()
     password = payload.password.strip()
-    if not email or not password:
-        raise HTTPException(status_code=400, detail="Email and password are required.")
+    first_name = payload.first_name.strip()
+    last_name = payload.last_name.strip()
+    if not email or not password or not first_name or not last_name:
+        raise HTTPException(status_code=400, detail="Email, password, first name, and last name are required.")
     if len(password.encode("utf-8")) > 72:
         raise HTTPException(status_code=400, detail="Password must be 72 bytes or fewer.")
 
@@ -1707,7 +1712,12 @@ def register(payload: RegisterRequest, db: OrmSession = Depends(get_db)):
     if existing:
         raise HTTPException(status_code=400, detail="Email already registered.")
 
-    user = User(email=email, password_hash=hash_password(password))
+    user = User(
+        email=email,
+        password_hash=hash_password(password),
+        first_name=first_name,
+        last_name=last_name,
+    )
     db.add(user)
     try:
         db.commit()
@@ -1743,7 +1753,21 @@ def login(payload: LoginRequest, db: OrmSession = Depends(get_db)):
         logger.exception("Failed to create session for user_id=%s", user.id)
         raise HTTPException(status_code=500, detail="Could not create session.") from exc
     logger.info("User logged in: user_id=%s", user.id)
-    return {"session_token": token, "email": user.email}
+    return {
+        "session_token": token,
+        "email": user.email,
+        "first_name": user.first_name or "",
+        "last_name": user.last_name or "",
+    }
+
+
+@app.get("/auth/me")
+def auth_me(user: User = Depends(get_current_user)):
+    return {
+        "email": user.email,
+        "first_name": user.first_name or "",
+        "last_name": user.last_name or "",
+    }
 
 
 @app.get("/latex/template")
