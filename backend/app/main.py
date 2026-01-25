@@ -34,7 +34,9 @@ load_dotenv()
 logger = logging.getLogger("resume-tweaker")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "").strip()
+OPENAI_MODEL_RESUME = os.getenv("OPENAI_MODEL_RESUME", OPENAI_MODEL).strip()
+OPENAI_MODEL_CHEAP = os.getenv("OPENAI_MODEL_CHEAP", OPENAI_MODEL).strip()
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "").strip()
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "").strip()
 GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI", "").strip()
@@ -1099,7 +1101,7 @@ def _call_openai_cover_letter(job_description: str, resume_text: str) -> str:
     }
 
     resp = client.chat.completions.create(
-        model=OPENAI_MODEL,
+        model=OPENAI_MODEL_CHEAP,
         messages=[
             {"role": "system", "content": COVER_LETTER_INSTRUCTIONS},
             {"role": "user", "content": json.dumps(payload)},
@@ -1138,7 +1140,7 @@ def _call_openai_cover_letter_body(job_description: str, resume_text: str) -> st
     }
 
     resp = client.chat.completions.create(
-        model=OPENAI_MODEL,
+        model=OPENAI_MODEL_CHEAP,
         messages=[
             {"role": "system", "content": COVER_LETTER_BODY_INSTRUCTIONS},
             {"role": "user", "content": json.dumps(payload)},
@@ -1230,7 +1232,7 @@ def _call_openai_linkedin_queries(
         "team": team or "",
     }
     resp = client.chat.completions.create(
-        model=OPENAI_MODEL,
+        model=OPENAI_MODEL_CHEAP,
         messages=[
             {"role": "system", "content": instructions},
             {"role": "user", "content": json.dumps(payload)},
@@ -1402,7 +1404,7 @@ def _call_openai_outreach_message(
         "resume_text": resume_text,
     }
     resp = client.chat.completions.create(
-        model=OPENAI_MODEL,
+        model=OPENAI_MODEL_CHEAP,
         messages=[
             {"role": "system", "content": instructions},
             {"role": "user", "content": json.dumps(payload)},
@@ -1464,7 +1466,7 @@ def _call_openai_full_resume_rewrite(job_description: str, resume_text: str) -> 
     )
 
     resp = client.chat.completions.create(
-        model=OPENAI_MODEL,
+        model=OPENAI_MODEL_RESUME,
         messages=[
             {"role": "system", "content": instructions},
             {"role": "user", "content": user_content},
@@ -1517,7 +1519,7 @@ def _call_openai_greeting(job_description: str) -> str:
     )
     payload = {"job_description": job_description}
     resp = client.chat.completions.create(
-        model=OPENAI_MODEL,
+        model=OPENAI_MODEL_CHEAP,
         messages=[
             {"role": "system", "content": instructions},
             {"role": "user", "content": json.dumps(payload)},
@@ -1580,7 +1582,7 @@ def _call_openai(
 
     # Use Chat Completions API for broad compatibility with installed SDK versions.
     resp = client.chat.completions.create(
-        model=OPENAI_MODEL,
+        model=OPENAI_MODEL_RESUME,
         messages=[
             {"role": "system", "content": instructions},
             {"role": "user", "content": json.dumps(payload)},
@@ -1683,7 +1685,13 @@ def _compile_latex_to_pdf_bytes(latex_text: str) -> bytes:
 
 @app.get("/health")
 def health():
-    return {"ok": True, "model": OPENAI_MODEL, "has_key": bool(OPENAI_API_KEY)}
+    return {
+        "ok": True,
+        "model": OPENAI_MODEL_RESUME,
+        "model_resume": OPENAI_MODEL_RESUME,
+        "model_cheap": OPENAI_MODEL_CHEAP,
+        "has_key": bool(OPENAI_API_KEY),
+    }
 
 
 @app.post("/auth/register")

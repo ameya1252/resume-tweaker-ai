@@ -324,6 +324,12 @@ textarea, input, button{font-family:inherit;}
 .edit-downloads{
   flex:0 0 auto;
 }
+.edit-downloads.panel{
+  padding:12px;
+}
+.edit-downloads .actions{
+  margin-top:0;
+}
 .saved-panel{
   flex:0 0 auto;
 }
@@ -332,6 +338,11 @@ textarea, input, button{font-family:inherit;}
   flex-direction:column;
   gap:10px;
   margin-top:8px;
+}
+.saved-footer{
+  margin-top:10px;
+  display:flex;
+  justify-content:flex-start;
 }
 .saved-item{
   display:flex;
@@ -503,7 +514,7 @@ textarea, input, button{font-family:inherit;}
   background: var(--error);
   border: 1px solid var(--error-stroke);
 }
-.preview-panel{margin-top:16px;}
+.preview-panel{margin-top:0;}
 .preview-head{
   display:flex;
   align-items:center;

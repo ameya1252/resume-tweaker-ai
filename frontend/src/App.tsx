@@ -640,6 +640,9 @@ export default function App() {
     downloadBytes(bytes, 'cover_letter.txt', 'text/plain')
   }
 
+  const savedPreview = downloadedResumes.slice(0, 1)
+  const hasMoreSaved = downloadedResumes.length > 1
+
   if (!isAuthenticated) {
     return (
       <div className="page">
@@ -939,7 +942,7 @@ export default function App() {
                   <div className="small subtle">No saved resumes yet.</div>
                 ) : (
                   <div className="saved-list">
-                    {downloadedResumes.map((resume) => (
+                    {savedPreview.map((resume) => (
                       <div className="saved-item" key={resume.id}>
                         <div className="saved-meta">
                           <div className="saved-name">{resume.name}</div>
@@ -957,6 +960,13 @@ export default function App() {
                         </div>
                       </div>
                     ))}
+                  </div>
+                )}
+                {hasMoreSaved && !downloadedLoading && (
+                  <div className="saved-footer">
+                    <button className="chip tiny" onClick={handleOpenSaved} type="button">
+                      Show more
+                    </button>
                   </div>
                 )}
                 {downloadedError && (
