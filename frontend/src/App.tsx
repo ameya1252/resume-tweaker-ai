@@ -178,6 +178,10 @@ export default function App() {
   const [authMode, setAuthMode] = useState<'login' | 'register'>('login')
   const [authLoading, setAuthLoading] = useState(false)
   const [authError, setAuthError] = useState<string | null>(null)
+  const [waitlistEmail, setWaitlistEmail] = useState('')
+  const [waitlistLoading, setWaitlistLoading] = useState(false)
+  const [waitlistStatus, setWaitlistStatus] = useState<string | null>(null)
+  const [waitlistError, setWaitlistError] = useState<string | null>(null)
   const [downloadedResumes, setDownloadedResumes] = useState<DownloadedResume[]>([])
   const [downloadedLoading, setDownloadedLoading] = useState(false)
   const [downloadedError, setDownloadedError] = useState<string | null>(null)
@@ -269,6 +273,36 @@ export default function App() {
   function handleLegalNav(nextStep: 'input' | 'edit' | 'outreach' | 'export' | 'saved') {
     setUiStep(nextStep)
     handleNavigate('/')
+  }
+
+  async function handleWaitlistSubmit(event: React.FormEvent) {
+    event.preventDefault()
+    const email = waitlistEmail.trim()
+    if (!email) {
+      setWaitlistError('Please enter a valid email.')
+      return
+    }
+    const emailOk = /^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/.test(email)
+    if (!emailOk) {
+      setWaitlistError('Please enter a valid email.')
+      return
+    }
+    setWaitlistLoading(true)
+    setWaitlistError(null)
+    setWaitlistStatus(null)
+    try {
+      await axios.post(`${BACKEND_URL}/waitlist`, { email })
+      setWaitlistStatus("🎉 You're in! We'll email you when the private beta opens.")
+      setWaitlistEmail('')
+    } catch (e: any) {
+      const msg =
+        e?.response?.data?.detail ||
+        e?.message ||
+        'Could not join the waitlist.'
+      setWaitlistError(String(msg))
+    } finally {
+      setWaitlistLoading(false)
+    }
   }
 
   async function loadUserProfile() {
@@ -1041,6 +1075,7 @@ export default function App() {
   const hasMoreSaved = downloadedResumes.length > 1
 
   const isLegalRoute = routePath !== '/' && ['/privacy', '/terms', '/security', '/contact'].includes(routePath)
+  const isWaitlistRoute = routePath === '/waitlist'
 
   if (isLegalRoute) {
     return (
@@ -1049,7 +1084,7 @@ export default function App() {
         <div className="container">
           <header className="topbar">
             <div className="brand">
-              <button className="logo-button" onClick={() => handleNavigate('/')} type="button" aria-label="Go to home">
+              <button className="logo-button" onClick={(e) => e.preventDefault()} type="button" aria-label="Tweakly">
                 <div className="logo" aria-hidden="true">
                   <div className="logo-mark">T</div>
                   <div className="logo-spark" />
@@ -1107,34 +1142,202 @@ export default function App() {
             {routePath === '/privacy' && (
               <>
                 <div className="h2">Privacy Policy</div>
-                <p className="p">We collect only what we need to run Tweakly: account email, resume content you upload, and usage analytics to improve the product.</p>
-                <p className="p">We do not sell your data. You can request deletion at any time by emailing support.</p>
+                <p className="p">Tweakly is a SaaS product that helps users improve resumes, generate cover letters, and plan outreach.</p>
+                <p className="p"><b>Information we collect:</b> account email; resume content and job descriptions you provide; and basic usage/analytics data (e.g., pages viewed, actions taken).</p>
+                <p className="p"><b>How we use your information:</b> to provide and improve the service, communicate with you about your account, and maintain security and fraud prevention.</p>
+                <p className="p"><b>Data storage and security:</b> we use encryption in transit and at rest where appropriate, and restrict access to authorized personnel and trusted providers.</p>
+                <p className="p"><b>Data sharing:</b> we do not sell your data. We may share limited data with trusted service providers for hosting, analytics, and infrastructure support.</p>
+                <p className="p"><b>User rights:</b> you can request access, correction, or deletion of your personal data by emailing us. You may also update your information in your account when available.</p>
+                <p className="p"><b>Cookies and analytics:</b> we use basic analytics tools and cookies to understand usage and improve the product.</p>
+                <p className="p"><b>Data retention:</b> we retain data only as long as needed to provide the service, comply with legal obligations, or resolve disputes.</p>
+                <p className="p"><b>Children’s privacy:</b> Tweakly is not intended for children under 13.</p>
+                <p className="p"><b>Changes to this policy:</b> we may update this policy from time to time. We will post updates on this page.</p>
+                <p className="p"><b>Contact:</b> tweaklyai@gmail.com</p>
               </>
             )}
             {routePath === '/terms' && (
               <>
                 <div className="h2">Terms of Service</div>
-                <p className="p">By using Tweakly, you agree to use the service responsibly and not upload content you don’t have rights to share.</p>
-                <p className="p">The service is provided as-is. We’re not liable for hiring outcomes or third‑party decisions.</p>
+                <p className="p">By accessing or using Tweakly, you agree to these Terms of Service.</p>
+                <p className="p"><b>Eligibility:</b> you must be at least 18 years old or have permission from a parent/guardian.</p>
+                <p className="p"><b>User responsibilities:</b> you agree not to upload content you don’t have the right to use, and not to use the service for illegal or harmful purposes.</p>
+                <p className="p"><b>Service description:</b> Tweakly provides AI-powered resume, cover letter, and outreach assistance. Content is generated based on user inputs.</p>
+                <p className="p"><b>No guarantee of employment:</b> we do not guarantee interviews, offers, or hiring outcomes.</p>
+                <p className="p"><b>Intellectual property:</b> you own your content. Tweakly owns the platform, software, and branding.</p>
+                <p className="p"><b>Limitation of liability:</b> the service is provided “as is” without warranties of any kind. To the maximum extent permitted by law, Tweakly is not liable for indirect, incidental, or consequential damages.</p>
+                <p className="p"><b>Account termination:</b> we may suspend or terminate accounts for misuse or policy violations.</p>
+                <p className="p"><b>Changes to the service:</b> we may update or discontinue features at any time.</p>
+                <p className="p"><b>Governing law:</b> these terms are governed by the laws of the United States.</p>
+                <p className="p"><b>Contact:</b> tweaklyai@gmail.com</p>
               </>
             )}
             {routePath === '/security' && (
               <>
                 <div className="h2">Security</div>
-                <p className="p">We encrypt credentials, restrict database access, and follow least‑privilege principles.</p>
-                <p className="p">If you find a vulnerability, please email us so we can fix it quickly.</p>
+                <p className="p">We take security seriously and design Tweakly with safety in mind.</p>
+                <p className="p"><b>Encryption:</b> data is encrypted in transit and at rest where appropriate.</p>
+                <p className="p"><b>Access control:</b> we follow least-privilege principles and restrict access to authorized personnel and services.</p>
+                <p className="p"><b>Secure hosting:</b> we use reputable cloud infrastructure and managed databases.</p>
+                <p className="p"><b>Monitoring and response:</b> we monitor for suspicious activity and respond to incidents promptly.</p>
+                <p className="p"><b>Responsible disclosure:</b> please report vulnerabilities to tweaklyai@gmail.com.</p>
+                <p className="p"><b>User responsibilities:</b> use strong passwords and keep your account credentials secure.</p>
               </>
             )}
             {routePath === '/contact' && (
               <>
                 <div className="h2">Contact</div>
-                <p className="p">Questions or feedback? Email us at support@your-domain.com.</p>
+                <p className="p">For questions, feedback, or support, contact us at:</p>
+                <p className="p"><b>tweaklyai@gmail.com</b></p>
+                <p className="p">We typically respond within 48 hours.</p>
               </>
             )}
-            <div className="actions">
-              <button className="btn" onClick={() => handleNavigate('/')}>Back to app</button>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  if (isWaitlistRoute) {
+    return (
+      <div className="page">
+        <div className="glow" />
+        <div className="container">
+          <header className="topbar">
+            <div className="brand">
+              <button className="logo-button" onClick={(e) => e.preventDefault()} type="button" aria-label="Tweakly">
+                <div className="logo" aria-hidden="true">
+                  <div className="logo-mark">T</div>
+                  <div className="logo-spark" />
+                </div>
+              </button>
+              <div>
+                <div className="brand-name">Tweakly</div>
+                <div className="brand-tag">Waitlist</div>
+              </div>
+            </div>
+          </header>
+          <div className="hero waitlist-hero">
+            <div className="eyebrow">Private beta • Early access</div>
+            <div className="h1">Your resume is good. Your conversion rate isn’t.</div>
+            <p className="p">
+              Tweakly turns a job description into a sharper resume, a tailored cover letter, and
+              outreach messaging in minutes — without wrecking your format.
+            </p>
+            {waitlistStatus ? (
+              <div className="waitlist-success">
+                <div className="waitlist-success-title">{waitlistStatus}</div>
+                <div className="small subtle">No spam. Early access only.</div>
+              </div>
+            ) : (
+              <form className="waitlist-form waitlist-form-hero" onSubmit={handleWaitlistSubmit}>
+                <div className="label">Email</div>
+                <input
+                  className="input"
+                  type="email"
+                  placeholder="you@company.com"
+                  value={waitlistEmail}
+                  onChange={(e) => setWaitlistEmail(e.target.value)}
+                  required
+                />
+                <button className="btn primary" type="submit" disabled={waitlistLoading}>
+                  {waitlistLoading ? 'Joining...' : 'Get early access'}
+                </button>
+                <div className="waitlist-microcopy">No spam. Early access only.</div>
+                {waitlistError && <div className="error"><b>Error:</b> {waitlistError}</div>}
+              </form>
+            )}
+            <div className="waitlist-trust">
+              Built for speed, used by early CS grads and founders in SF.
+            </div>
+            <div className="waitlist-urgency">Limited seats in the private beta. Join early.</div>
+          </div>
+          <div className="waitlist-proof">
+            <div className="waitlist-proof-card soft">
+              <div className="waitlist-proof-title">Early users</div>
+              <div className="waitlist-proof-metric">120+</div>
+              <div className="small subtle">Students + builders across 8 universities.</div>
+            </div>
+            <div className="waitlist-proof-card soft">
+              <div className="waitlist-proof-title">Beta testers</div>
+              <div className="waitlist-proof-metric">35</div>
+              <div className="small subtle">Launching roles in SWE, DS, PM.</div>
+            </div>
+            <div className="waitlist-proof-card soft">
+              <div className="waitlist-proof-title">Iterations</div>
+              <div className="waitlist-proof-metric">3x</div>
+              <div className="small subtle">Faster resume edits per job.</div>
             </div>
           </div>
+          <div className="waitlist-sections">
+            <div className="panel soft-panel">
+              <div className="preview-head">
+                <div className="h2">How it works</div>
+                <div className="small subtle">From JD to ready-to-send in four steps.</div>
+              </div>
+              <div className="waitlist-steps">
+                <div className="waitlist-step-card soft">
+                  <div className="waitlist-step-count">1</div>
+                  <div className="waitlist-step-body">
+                    <div className="waitlist-step-title">Paste the job description</div>
+                    <div className="small subtle">We extract role signals and keywords.</div>
+                  </div>
+                </div>
+                <div className="waitlist-step-card soft">
+                  <div className="waitlist-step-count">2</div>
+                  <div className="waitlist-step-body">
+                    <div className="waitlist-step-title">Auto-tune your resume</div>
+                    <div className="small subtle">Bullet-level edits, layout preserved.</div>
+                  </div>
+                </div>
+                <div className="waitlist-step-card soft">
+                  <div className="waitlist-step-count">3</div>
+                  <div className="waitlist-step-body">
+                    <div className="waitlist-step-title">Generate a cover letter</div>
+                    <div className="small subtle">Short, targeted, recruiter-ready.</div>
+                  </div>
+                </div>
+                <div className="waitlist-step-card soft">
+                  <div className="waitlist-step-count">4</div>
+                  <div className="waitlist-step-body">
+                    <div className="waitlist-step-title">Launch outreach</div>
+                    <div className="small subtle">Targets + cold messages in one place.</div>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div className="panel soft-panel">
+              <div className="preview-head">
+                <div className="h2">Why Tweakly</div>
+                <div className="small subtle">Built for conversion, not fluff.</div>
+              </div>
+              <div className="waitlist-why">
+                <div className="waitlist-why-item soft">
+                  <div className="waitlist-why-title">Bullet-level precision</div>
+                  <div className="small subtle">Rewrite only the bullets that matter for the role.</div>
+                </div>
+                <div className="waitlist-why-item soft">
+                  <div className="waitlist-why-title">ATS-aligned by default</div>
+                  <div className="small subtle">Keyword matching and structure that screens well.</div>
+                </div>
+                <div className="waitlist-why-item soft">
+                  <div className="waitlist-why-title">Outreach strategy built-in</div>
+                  <div className="small subtle">LinkedIn targets + ready-to-send messages.</div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <footer className="footer">
+            <div className="footer-title">Built for people who geek out on clean signal.</div>
+            <div className="footer-copy">
+              Tweakly is your resume co-processor: fast iterations, minimal noise, maximal clarity.
+            </div>
+            <div className="footer-links">
+              <a href="/privacy" className="footer-link" onClick={(e) => { e.preventDefault(); handleNavigate('/privacy') }}>Privacy</a>
+              <a href="/terms" className="footer-link" onClick={(e) => { e.preventDefault(); handleNavigate('/terms') }}>Terms</a>
+              <a href="/security" className="footer-link" onClick={(e) => { e.preventDefault(); handleNavigate('/security') }}>Security</a>
+              <a href="/contact" className="footer-link" onClick={(e) => { e.preventDefault(); handleNavigate('/contact') }}>Contact</a>
+            </div>
+          </footer>
         </div>
       </div>
     )

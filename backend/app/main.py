@@ -27,7 +27,7 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
 from db import Base, SessionLocal, engine
-from models import DownloadedResume, GoogleCredential, GoogleOAuthState, Resume
+from models import DownloadedResume, GoogleCredential, GoogleOAuthState, Resume, WaitlistEntry
 from models import Session as SessionModel
 from models import User
 
@@ -261,6 +261,10 @@ class GoogleCoverLetterPreviewRequest(BaseModel):
 
 class GoogleDocTextRequest(BaseModel):
     doc_id: str
+
+
+class WaitlistRequest(BaseModel):
+    email: str
 
 
 class OutreachPreviewRequest(BaseModel):
@@ -2749,6 +2753,22 @@ def google_doc_text(
     resume_doc = docs.documents().get(documentId=payload.doc_id).execute()
     resume_text = _extract_google_doc_text(resume_doc)
     return {"text": resume_text}
+
+
+@app.post("/waitlist")
+def waitlist_signup(payload: WaitlistRequest, db: OrmSession = Depends(get_db)):
+    email = payload.email.strip().lower()
+    if not email or "@" not in email:
+        raise HTTPException(status_code=400, detail="Valid email is required.")
+    entry = WaitlistEntry(email=email)
+    db.add(entry)
+    try:
+        db.commit()
+    except SQLAlchemyError as exc:
+        db.rollback()
+        logger.exception("Failed to save waitlist entry: email=%s", email)
+        raise HTTPException(status_code=500, detail="Could not save waitlist entry.") from exc
+    return {"ok": True}
 
 
 @app.post("/optimize")
