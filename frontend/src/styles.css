@@ -299,6 +299,24 @@ textarea, input, button{font-family:inherit;}
   gap:10px;
   margin:12px 0 10px;
   flex-wrap:wrap;
+  align-items:center;
+}
+.gdocs-actions .badge{
+  display:inline-flex;
+  align-items:center;
+  line-height:1;
+}
+.gdocs-block{
+  margin-top:40px;
+}
+.gdocs-actions-block{
+  margin-top:32px;
+}
+.status-row-gdocs{
+  margin-top:32px;
+}
+.gdocs-center{
+  justify-content:center;
 }
 .edit-layout{
   display:grid;

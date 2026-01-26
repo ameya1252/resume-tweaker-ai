@@ -14,7 +14,7 @@ from urllib.parse import quote
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from openai import OpenAI
 from passlib.context import CryptContext
 from pydantic import BaseModel, Field
@@ -2456,7 +2456,23 @@ def auth_google_callback(request: Request, code: str, state: Optional[str] = Non
         "client_secret": creds.client_secret,
         "scopes": creds.scopes,
     }
-    return JSONResponse({"ok": True, "message": "Google Docs connected. You can close this tab."})
+    html = (
+        "<!doctype html>"
+        "<html><head><meta charset=\"utf-8\">"
+        "<title>Google Docs connected</title></head>"
+        "<body>"
+        "<script>"
+        "if (window.opener) {"
+        "window.opener.postMessage({ type: 'google-auth-success' }, '*');"
+        "}"
+        "window.close();"
+        "setTimeout(function(){"
+        "document.body.innerHTML = '<p>Google Docs connected. You can close this tab.</p>';"
+        "}, 200);"
+        "</script>"
+        "</body></html>"
+    )
+    return HTMLResponse(content=html)
 
 
 @app.get("/google/docs")

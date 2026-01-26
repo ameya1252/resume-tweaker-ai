@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react'
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import axios from 'axios'
 import ResumeEditorStructured from './components/ResumeEditorStructured'
 import OptimizeProgressOverlay from './components/OptimizeProgressOverlay'
@@ -190,6 +190,7 @@ export default function App() {
   const [googleDocs, setGoogleDocs] = useState<GoogleDoc[]>([])
   const [selectedDocId, setSelectedDocId] = useState('')
   const [coverDocId, setCoverDocId] = useState('')
+  const [gdocsConnected, setGdocsConnected] = useState(false)
   const [gdocsStatus, setGdocsStatus] = useState<string | null>(null)
   const [coverLetterStatus, setCoverLetterStatus] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
@@ -216,6 +217,13 @@ export default function App() {
   const [updatedTitles, setUpdatedTitles] = useState<Array<{ id: string; company?: string }>>([])
   const previewRef = useRef<HTMLDivElement | null>(null)
   const outreachKeyRef = useRef<string>('')
+  const backendOrigin = useMemo(() => {
+    try {
+      return new URL(BACKEND_URL).origin
+    } catch {
+      return ''
+    }
+  }, [])
 
   const isAuthenticated = !!sessionToken
   const userInitial = (userEmail.trim()[0] || 'U').toUpperCase()
@@ -701,26 +709,62 @@ export default function App() {
     window.open(`${BACKEND_URL}/auth/google`, '_blank', 'width=520,height=720')
   }
 
-  async function loadGoogleDocs() {
-    setError(null)
+  const loadGoogleDocs = useCallback(async (showError = true) => {
+    if (showError) {
+      setError(null)
+    }
     try {
       const res = await axios.get(`${BACKEND_URL}/google/docs`)
       const files = Array.isArray(res.data?.files) ? res.data.files : []
+      const firstId = files[0]?.id || ''
+      const nextSelectedId = selectedDocId || firstId
+      const nextCoverId = coverDocId || nextSelectedId
       setGoogleDocs(files)
-      if (!selectedDocId && files.length > 0) {
-        setSelectedDocId(files[0].id)
+      setGdocsConnected(true)
+      if (!selectedDocId && nextSelectedId) {
+        setSelectedDocId(nextSelectedId)
       }
-      if (!coverDocId && files.length > 0) {
-        setCoverDocId(selectedDocId || files[0].id)
+      if (!coverDocId && nextCoverId) {
+        setCoverDocId(nextCoverId)
       }
+      return { files, selectedId: nextSelectedId, coverId: nextCoverId }
     } catch (e: any) {
-      const msg =
-        e?.response?.data?.detail ||
-        e?.message ||
-        'Could not load Google Docs. Please connect your account.'
-      setError(String(msg))
+      if (showError) {
+        const msg =
+          e?.response?.data?.detail ||
+          e?.message ||
+          'Could not load Google Docs. Please connect your account.'
+        setError(String(msg))
+      }
+      setGdocsConnected(false)
+      return null
     }
-  }
+  }, [coverDocId, selectedDocId])
+
+  useEffect(() => {
+    function handleMessage(event: MessageEvent) {
+      if (backendOrigin && event.origin !== backendOrigin) return
+      const payload = event.data
+      if (!payload || typeof payload !== 'object') return
+      if (payload.type === 'google-auth-success') {
+        setGdocsConnected(true)
+        setGdocsStatus('Google Docs connected. Refreshing list...')
+        loadGoogleDocs()
+      }
+    }
+    window.addEventListener('message', handleMessage)
+    return () => window.removeEventListener('message', handleMessage)
+  }, [backendOrigin, loadGoogleDocs])
+
+  useEffect(() => {
+    if (!isAuthenticated) return
+    loadGoogleDocs(false)
+  }, [isAuthenticated, loadGoogleDocs])
+
+  useEffect(() => {
+    if (mode !== 'gdocs') return
+    loadGoogleDocs()
+  }, [mode, loadGoogleDocs])
 
   async function handleOptimize() {
     setError(null)
@@ -731,8 +775,10 @@ export default function App() {
     let nextStep: 'input' | 'edit' | 'export' | null = null
     try {
       if (mode === 'gdocs') {
+        const refreshed = await loadGoogleDocs()
+        const docId = selectedDocId || refreshed?.selectedId || ''
         const res = await axios.post(`${BACKEND_URL}/google/docs/optimize`, {
-          doc_id: selectedDocId,
+          doc_id: docId,
           job_description: jobDescription,
         })
         const { bullets_edited, keyword_hints } = res.data || {}
@@ -1191,15 +1237,16 @@ export default function App() {
                   </div>
                 </>
               ) : (
-                <>
-                  <div className="gdocs-actions">
-                    <button className="btn" onClick={openGoogleAuth}>
-                      Connect Google Docs
-                    </button>
-                    <button className="btn" onClick={loadGoogleDocs}>
-                      Refresh Docs
-                    </button>
-                  </div>
+                <div className="gdocs-block">
+                <div className="gdocs-actions">
+                  <button className="btn" onClick={openGoogleAuth}>
+                    Connect Google Docs
+                  </button>
+                  <button className="btn" onClick={loadGoogleDocs}>
+                    Refresh Docs
+                  </button>
+                  {gdocsConnected && <span className="badge ok">Connected</span>}
+                </div>
                   <select
                     className="input"
                     value={selectedDocId}
@@ -1211,20 +1258,19 @@ export default function App() {
                     ))}
                   </select>
                   <div className="small subtle">Export PDF from Google Docs → File → Download.</div>
-                </>
+                </div>
               )}
 
               {mode === 'gdocs' && (
-                <div className="actions">
+                <div className="actions gdocs-actions-block gdocs-center">
                   <button className="btn primary" disabled={!canOptimize || loading} onClick={handleOptimize}>
                     {loading ? 'Tuning…' : 'Tweak in 30s'}
                   </button>
                 </div>
               )}
 
-              <div className="status-row">
+              <div className={`status-row ${mode === 'gdocs' ? 'status-row-gdocs' : ''}`}>
                 {mode === 'latex' && pdfAvailable && <span className="badge ok">PDF ready</span>}
-                {mode === 'gdocs' && <span className="badge">Google Docs</span>}
                 {bulletsEdited !== null && (
                   <span className="small">
                     Edited bullets: <b>{bulletsEdited}</b>
