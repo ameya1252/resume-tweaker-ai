@@ -255,6 +255,15 @@ class GoogleCoverLetterRequest(BaseModel):
     job_description: str
 
 
+class GoogleCoverLetterPreviewRequest(BaseModel):
+    resume_doc_id: str
+    job_description: str
+
+
+class GoogleDocTextRequest(BaseModel):
+    doc_id: str
+
+
 class OutreachPreviewRequest(BaseModel):
     job_description: str
     resume_text: str
@@ -2615,6 +2624,26 @@ def coverletter_google_doc(payload: GoogleCoverLetterRequest):
     docs.documents().batchUpdate(documentId=payload.cover_doc_id, body={"requests": requests}).execute()
 
     return {"ok": True, "cover_letter": cover_letter}
+
+
+@app.post("/google/coverletter/preview")
+def coverletter_google_preview(payload: GoogleCoverLetterPreviewRequest):
+    creds = _get_google_creds()
+    docs = build("docs", "v1", credentials=creds)
+
+    resume_doc = docs.documents().get(documentId=payload.resume_doc_id).execute()
+    resume_text = _extract_google_doc_text(resume_doc)
+    cover_letter = _call_openai_cover_letter(payload.job_description, resume_text)
+    return {"cover_letter": cover_letter}
+
+
+@app.post("/google/docs/text")
+def google_doc_text(payload: GoogleDocTextRequest):
+    creds = _get_google_creds()
+    docs = build("docs", "v1", credentials=creds)
+    resume_doc = docs.documents().get(documentId=payload.doc_id).execute()
+    resume_text = _extract_google_doc_text(resume_doc)
+    return {"text": resume_text}
 
 
 @app.post("/optimize")

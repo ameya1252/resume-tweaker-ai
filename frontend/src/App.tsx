@@ -188,10 +188,16 @@ export default function App() {
   const [hasTemplate, setHasTemplate] = useState(false)
   const [mode, setMode] = useState<'latex' | 'gdocs'>('latex')
   const [googleDocs, setGoogleDocs] = useState<GoogleDoc[]>([])
-  const [selectedDocId, setSelectedDocId] = useState('')
-  const [coverDocId, setCoverDocId] = useState('')
+  const [selectedDocId, setSelectedDocId] = useState(
+    () => localStorage.getItem('gdocs_selected_doc_id') || '',
+  )
+  const [coverDocId, setCoverDocId] = useState(
+    () => localStorage.getItem('gdocs_cover_doc_id') || '',
+  )
   const [gdocsConnected, setGdocsConnected] = useState(false)
   const [gdocsStatus, setGdocsStatus] = useState<string | null>(null)
+  const [gdocsPreviewLoaded, setGdocsPreviewLoaded] = useState(false)
+  const [gdocsPreviewFailed, setGdocsPreviewFailed] = useState(false)
   const [coverLetterStatus, setCoverLetterStatus] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
   const [coverLoading, setCoverLoading] = useState(false)
@@ -216,6 +222,7 @@ export default function App() {
   const [draft, setDraft] = useState<Draft | null>(null)
   const [updatedTitles, setUpdatedTitles] = useState<Array<{ id: string; company?: string }>>([])
   const previewRef = useRef<HTMLDivElement | null>(null)
+  const gdocsPreviewTimerRef = useRef<number | null>(null)
   const outreachKeyRef = useRef<string>('')
   const backendOrigin = useMemo(() => {
     try {
@@ -235,6 +242,22 @@ export default function App() {
       delete axios.defaults.headers.common.Authorization
     }
   }, [sessionToken])
+
+  useEffect(() => {
+    if (selectedDocId) {
+      localStorage.setItem('gdocs_selected_doc_id', selectedDocId)
+    } else {
+      localStorage.removeItem('gdocs_selected_doc_id')
+    }
+  }, [selectedDocId])
+
+  useEffect(() => {
+    if (coverDocId) {
+      localStorage.setItem('gdocs_cover_doc_id', coverDocId)
+    } else {
+      localStorage.removeItem('gdocs_cover_doc_id')
+    }
+  }, [coverDocId])
 
   useEffect(() => {
     const handlePop = () => setRoutePath(window.location.pathname)
@@ -431,6 +454,8 @@ export default function App() {
     localStorage.removeItem('user_email')
     localStorage.removeItem('user_first_name')
     localStorage.removeItem('user_last_name')
+    localStorage.removeItem('gdocs_selected_doc_id')
+    localStorage.removeItem('gdocs_cover_doc_id')
     setSessionToken('')
     setUserEmail('')
     setUserFirstName('')
@@ -473,10 +498,10 @@ export default function App() {
 
   const canGenerateCover = useMemo(() => {
     if (mode === 'gdocs') {
-      return jobDescription.trim().length > 40 && !!selectedDocId && !!coverDocId
+      return jobDescription.trim().length > 40 && !!selectedDocId
     }
     return jobDescription.trim().length > 40 && hasTemplate
-  }, [jobDescription, mode, selectedDocId, coverDocId, hasTemplate])
+  }, [jobDescription, mode, selectedDocId, hasTemplate])
 
   const longBulletCount = useMemo(() => {
     if (!draft) return 0
@@ -537,6 +562,20 @@ export default function App() {
     return parts.join('\n').trim()
   }, [draft, draftExperiences, draftProjects])
 
+  const selectedDocName = useMemo(() => {
+    return googleDocs.find((doc) => doc.id === selectedDocId)?.name || 'Selected Google Doc'
+  }, [googleDocs, selectedDocId])
+
+  const gdocsPreviewUrl = useMemo(() => {
+    if (!selectedDocId) return ''
+    return `https://docs.google.com/document/d/${selectedDocId}/preview`
+  }, [selectedDocId])
+
+  const gdocsOpenUrl = useMemo(() => {
+    if (!selectedDocId) return ''
+    return `https://docs.google.com/document/d/${selectedDocId}/edit`
+  }, [selectedDocId])
+
 
   const estimatedPdfPages = useMemo(() => {
     if (!pdfB64) return 0
@@ -558,29 +597,68 @@ export default function App() {
   }, [uiStep, draft])
 
   useEffect(() => {
-    if (uiStep !== 'outreach' || !draft) return
-    if (!jobDescription.trim() || !resumeText.trim()) return
-    const key = `${jobDescription.trim()}::${resumeText.trim()}`
-    if (outreachKeyRef.current === key && outreachPreview) return
-
-    outreachKeyRef.current = key
-    setOutreachLoading(true)
-    setOutreachError(null)
-    axios.post(`${BACKEND_URL}/outreach/preview`, {
-      job_description: jobDescription,
-      resume_text: resumeText,
-    }).then((res) => {
-      setOutreachPreview(res.data)
-    }).catch((e: any) => {
-      const msg =
-        e?.response?.data?.detail ||
-        e?.message ||
-        'Could not generate outreach preview.'
-      setOutreachError(String(msg))
-    }).finally(() => {
-      setOutreachLoading(false)
-    })
-  }, [uiStep, draft, jobDescription, resumeText])
+    if (uiStep !== 'outreach') return
+    if (!jobDescription.trim()) return
+    if (mode === 'latex' && !draft) return
+    let active = true
+    const run = async () => {
+      let outreachResumeText = resumeText
+      if (mode === 'gdocs') {
+        if (!selectedDocId) {
+          setOutreachError('Select a Google Doc to generate outreach.')
+          return
+        }
+        try {
+          const res = await axios.post(`${BACKEND_URL}/google/docs/text`, {
+            doc_id: selectedDocId,
+          })
+          outreachResumeText = String(res.data?.text || '')
+        } catch (e: any) {
+          const msg =
+            e?.response?.data?.detail ||
+            e?.message ||
+            'Could not read Google Doc text.'
+          if (active) {
+            setOutreachError(String(msg))
+          }
+          return
+        }
+      }
+      if (!outreachResumeText.trim()) return
+      const key = `${jobDescription.trim()}::${outreachResumeText.trim()}`
+      if (outreachKeyRef.current === key && outreachPreview) return
+      outreachKeyRef.current = key
+      if (active) {
+        setOutreachLoading(true)
+        setOutreachError(null)
+      }
+      try {
+        const res = await axios.post(`${BACKEND_URL}/outreach/preview`, {
+          job_description: jobDescription,
+          resume_text: outreachResumeText,
+        })
+        if (active) {
+          setOutreachPreview(res.data)
+        }
+      } catch (e: any) {
+        const msg =
+          e?.response?.data?.detail ||
+          e?.message ||
+          'Could not generate outreach preview.'
+        if (active) {
+          setOutreachError(String(msg))
+        }
+      } finally {
+        if (active) {
+          setOutreachLoading(false)
+        }
+      }
+    }
+    run()
+    return () => {
+      active = false
+    }
+  }, [uiStep, mode, draft, jobDescription, resumeText, selectedDocId, outreachPreview])
 
 
   async function handleApplyDraft(
@@ -766,6 +844,30 @@ export default function App() {
     loadGoogleDocs()
   }, [mode, loadGoogleDocs])
 
+  useEffect(() => {
+    if (mode !== 'gdocs' || uiStep !== 'edit') return
+    if (selectedDocId && !coverDocId) {
+      setCoverDocId(selectedDocId)
+    }
+  }, [mode, uiStep, selectedDocId, coverDocId])
+
+  useEffect(() => {
+    if (mode !== 'gdocs' || uiStep !== 'edit' || !selectedDocId) return
+    setGdocsPreviewLoaded(false)
+    setGdocsPreviewFailed(false)
+    if (gdocsPreviewTimerRef.current) {
+      window.clearTimeout(gdocsPreviewTimerRef.current)
+    }
+    gdocsPreviewTimerRef.current = window.setTimeout(() => {
+      setGdocsPreviewFailed(true)
+    }, 8000)
+    return () => {
+      if (gdocsPreviewTimerRef.current) {
+        window.clearTimeout(gdocsPreviewTimerRef.current)
+      }
+    }
+  }, [mode, uiStep, selectedDocId])
+
   async function handleOptimize() {
     setError(null)
     const startTime = Date.now()
@@ -787,7 +889,7 @@ export default function App() {
         setGdocsStatus('Updated in Google Docs. Open your doc to review the changes.')
         setPdfUrl('')
         setDraft(null)
-        nextStep = 'input'
+        nextStep = 'edit'
         return
       }
 
@@ -840,16 +942,19 @@ export default function App() {
     setCoverLetterText('')
     try {
       if (mode === 'gdocs') {
-        const res = await axios.post(`${BACKEND_URL}/google/coverletter`, {
+        if (!selectedDocId) {
+          setError('Select a Google Doc to generate a cover letter.')
+          return
+        }
+        const res = await axios.post(`${BACKEND_URL}/google/coverletter/preview`, {
           resume_doc_id: selectedDocId,
-          cover_doc_id: coverDocId,
           job_description: jobDescription,
         })
         const coverLetter = res.data?.cover_letter
         if (typeof coverLetter === 'string') {
           setCoverLetterText(coverLetter)
         }
-        setCoverLetterStatus('Cover letter updated in Google Docs.')
+        setCoverLetterStatus('Cover letter generated.')
         return
       }
 
@@ -963,14 +1068,14 @@ export default function App() {
               <button
                 className={`chip ${uiStep === 'edit' ? 'active' : ''}`}
                 onClick={() => handleLegalNav('edit')}
-                disabled={!draft}
+                disabled={mode === 'gdocs' ? !selectedDocId : !draft}
               >
                 Tune & Edit
               </button>
               <button
                 className={`chip ${uiStep === 'outreach' ? 'active' : ''}`}
                 onClick={() => handleLegalNav('outreach')}
-                disabled={!draft}
+                disabled={mode === 'gdocs' ? !selectedDocId : !draft}
               >
                 Outreach
               </button>
@@ -1153,14 +1258,14 @@ export default function App() {
             <button
               className={`chip ${uiStep === 'edit' ? 'active' : ''}`}
               onClick={() => setUiStep('edit')}
-              disabled={!draft}
+              disabled={mode === 'gdocs' ? !selectedDocId : !draft}
             >
               Tune & Edit
             </button>
             <button
               className={`chip ${uiStep === 'outreach' ? 'active' : ''}`}
               onClick={() => setUiStep('outreach')}
-              disabled={!draft}
+              disabled={mode === 'gdocs' ? !selectedDocId : !draft}
             >
               Outreach
             </button>
@@ -1310,6 +1415,53 @@ export default function App() {
           </div>
         )}
 
+        {mode === 'gdocs' && uiStep === 'edit' && (
+          <div className="gdocs-preview-layout">
+            <div className="panel gdocs-preview-panel">
+              <div className="preview-head">
+                <div>
+                  <div className="h2">Google Doc Preview</div>
+                  <div className="small subtle">Read-only preview of your Google Doc.</div>
+                </div>
+                {selectedDocId && (
+                  <a className="btn" href={gdocsOpenUrl} target="_blank" rel="noreferrer">
+                    Edit Google Doc
+                  </a>
+                )}
+              </div>
+              {!selectedDocId ? (
+                <div className="small subtle">Select a Google Doc to preview.</div>
+              ) : gdocsPreviewFailed ? (
+                <div className="gdocs-preview-fallback">
+                  <div className="small subtle">This doc cannot be previewed here.</div>
+                  <a className="btn primary" href={gdocsOpenUrl} target="_blank" rel="noreferrer">
+                    Open Google Doc
+                  </a>
+                </div>
+              ) : (
+                <iframe
+                  className="gdocs-preview-frame"
+                  src={gdocsPreviewUrl}
+                  title="Google Doc preview"
+                  onLoad={() => {
+                    setGdocsPreviewLoaded(true)
+                    setGdocsPreviewFailed(false)
+                    if (gdocsPreviewTimerRef.current) {
+                      window.clearTimeout(gdocsPreviewTimerRef.current)
+                    }
+                  }}
+                  onError={() => {
+                    setGdocsPreviewFailed(true)
+                  }}
+                />
+              )}
+              {!gdocsPreviewFailed && !gdocsPreviewLoaded && selectedDocId && (
+                <div className="small subtle">Loading preview...</div>
+              )}
+            </div>
+          </div>
+        )}
+
         {mode === 'latex' && draft && (uiStep === 'edit' || uiStep === 'export') && (
           <div className="edit-layout" ref={editPanelRef}>
             <div className="edit-col">
@@ -1418,18 +1570,11 @@ export default function App() {
 
             {mode === 'gdocs' && (
               <>
-                <div className="label">Cover letter Google Doc</div>
-                <select
-                  className="input"
-                  value={coverDocId}
-                  onChange={(e) => setCoverDocId(e.target.value)}
-                >
-                  <option value="">Select a Google Doc…</option>
-                  {googleDocs.map((doc) => (
-                    <option key={doc.id} value={doc.id}>{doc.name}</option>
-                  ))}
-                </select>
-                <div className="small subtle">This doc will be overwritten with the generated cover letter.</div>
+                <div className="label">Cover letter source</div>
+                <div className="small subtle">
+                  Using resume: <b>{selectedDocName}</b>
+                </div>
+                <div className="small subtle">The cover letter will appear below.</div>
               </>
             )}
 
