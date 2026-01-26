@@ -3,7 +3,7 @@ import axios from 'axios'
 import ResumeEditorStructured from './components/ResumeEditorStructured'
 import OptimizeProgressOverlay from './components/OptimizeProgressOverlay'
 import { estimateVisualLines } from './utils/formatting'
-import { buildDraftExperiences, Draft, DraftApplyRequest, DraftExperience } from './utils/draft'
+import { buildDraftExperiences, buildDraftProjects, Draft, DraftApplyRequest, DraftExperience, DraftProject } from './utils/draft'
 
 const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || 'http://localhost:8000'
 
@@ -471,8 +471,12 @@ export default function App() {
   }, [jobDescription, mode, selectedDocId, coverDocId, hasTemplate])
 
   const longBulletCount = useMemo(() => {
-    if (!draft?.bullets?.length) return 0
-    return draft.bullets.filter((b) => estimateVisualLines(b.text) > 1).length
+    if (!draft) return 0
+    const exp = draft.bullets ? draft.bullets.filter((b) => estimateVisualLines(b.text) > 1).length : 0
+    const proj = draft.project_bullets
+      ? draft.project_bullets.filter((b) => estimateVisualLines(b.text) > 1).length
+      : 0
+    return exp + proj
   }, [draft])
 
   const skillsTooLong = useMemo(() => {
@@ -493,6 +497,15 @@ export default function App() {
     return buildDraftExperiences(draft.titles || [], draft.bullets || [], draft.companies || [], companyByTitleId)
   }, [draft, companyByTitleId])
 
+  const draftProjects: DraftProject[] = useMemo(() => {
+    if (!draft) return []
+    return buildDraftProjects(
+      draft.project_titles || [],
+      draft.project_dates || [],
+      draft.project_bullets || [],
+    )
+  }, [draft])
+
   const resumeText = useMemo(() => {
     if (!draft) return ''
     const parts: string[] = []
@@ -503,11 +516,18 @@ export default function App() {
         parts.push(`- ${b.text}`)
       }
     }
+    for (const proj of draftProjects) {
+      const dates = proj.dates ? ` (${proj.dates})` : ''
+      parts.push(`${proj.name || 'Project'}${dates}`)
+      for (const b of proj.bullets) {
+        parts.push(`- ${b.text}`)
+      }
+    }
     if (draft.skills) {
       parts.push(`Skills: ${draft.skills}`)
     }
     return parts.join('\n').trim()
-  }, [draft, draftExperiences])
+  }, [draft, draftExperiences, draftProjects])
 
 
   const estimatedPdfPages = useMemo(() => {
@@ -584,6 +604,9 @@ export default function App() {
     const titleById = new Map((changes.titles || []).map((t) => [t.id, t.text]))
     const companyById = new Map((changes.companies || []).map((c) => [c.id, c.text]))
     const bulletById = new Map((changes.bullets || []).map((b) => [b.id, b.text]))
+    const projectTitleById = new Map((changes.project_titles || []).map((t) => [t.id, t.text]))
+    const projectDateById = new Map((changes.project_dates || []).map((d) => [d.id, d.text]))
+    const projectBulletById = new Map((changes.project_bullets || []).map((b) => [b.id, b.text]))
     const baseCompanies = (draft.companies && draft.companies.length > 0)
       ? draft.companies
       : draft.titles.map((t) => ({ id: t.id, text: companyByTitleId[t.id] || '' }))
@@ -599,6 +622,18 @@ export default function App() {
       bullets: draft.bullets.map((b) => ({
         ...b,
         text: bulletById.has(b.id) ? String(bulletById.get(b.id)) : b.text,
+      })),
+      project_titles: (draft.project_titles || []).map((t) => ({
+        ...t,
+        text: projectTitleById.has(t.id) ? String(projectTitleById.get(t.id)) : t.text,
+      })),
+      project_dates: (draft.project_dates || []).map((d) => ({
+        ...d,
+        text: projectDateById.has(d.id) ? String(projectDateById.get(d.id)) : d.text,
+      })),
+      project_bullets: (draft.project_bullets || []).map((b) => ({
+        ...b,
+        text: projectBulletById.has(b.id) ? String(projectBulletById.get(b.id)) : b.text,
       })),
       skills: typeof changes.skills === 'string' ? changes.skills : draft.skills,
     }
@@ -1229,24 +1264,11 @@ export default function App() {
         {mode === 'latex' && draft && (uiStep === 'edit' || uiStep === 'export') && (
           <div className="edit-layout" ref={editPanelRef}>
             <div className="edit-col">
-              <div className="panel preview-panel edit-preview" ref={previewRef}>
-                <div className="preview-head">
-                  <div className="h2">Preview</div>
-                  <div className="small subtle">
-                    {mode === 'latex' ? 'PDF preview (compiled from LaTeX).' : 'Preview not available for Google Docs.'}
-                  </div>
-                </div>
-                {mode === 'latex' ? (
-                  pdfUrl ? (
-                    <iframe className="preview-frame" src={pdfUrl} title="Resume PDF preview" />
-                  ) : (
-                    <div className="preview">No preview yet.</div>
-                  )
-                ) : (
-                  <div className="preview">Preview not available for Google Docs.</div>
-                )}
-              </div>
               <div className="panel edit-downloads">
+                <div className="preview-head">
+                  <div className="h2">Downloads</div>
+                  <div className="small subtle">Export the latest draft as .tex or PDF.</div>
+                </div>
                 <div className="actions">
                   {mode === 'latex' && (
                     <>
@@ -1263,6 +1285,23 @@ export default function App() {
                   <div className="status-row">
                     <span className="badge warn">Estimate: Likely 2 pages</span>
                   </div>
+                )}
+              </div>
+              <div className="panel preview-panel edit-preview" ref={previewRef}>
+                <div className="preview-head">
+                  <div className="h2">Preview</div>
+                  <div className="small subtle">
+                    {mode === 'latex' ? 'PDF preview (compiled from LaTeX).' : 'Preview not available for Google Docs.'}
+                  </div>
+                </div>
+                {mode === 'latex' ? (
+                  pdfUrl ? (
+                    <iframe className="preview-frame" src={pdfUrl} title="Resume PDF preview" />
+                  ) : (
+                    <div className="preview">No preview yet.</div>
+                  )
+                ) : (
+                  <div className="preview">Preview not available for Google Docs.</div>
                 )}
               </div>
               <div className="panel saved-panel">
@@ -1312,6 +1351,7 @@ export default function App() {
               <div className="edit-editor">
                 <ResumeEditorStructured
                   draftExperiences={draftExperiences}
+                  draftProjects={draftProjects}
                   skillsText={draft.skills || ''}
                   onApply={handleApplyChanges}
                 />

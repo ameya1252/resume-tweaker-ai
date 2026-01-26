@@ -304,7 +304,7 @@ textarea, input, button{font-family:inherit;}
   display:grid;
   grid-template-columns:repeat(2, minmax(0, 1fr));
   gap:16px;
-  margin-top:16px;
+  margin-top:4px;
   align-items:stretch;
   min-height:calc(100vh - 220px);
   animation:edit-enter 240ms ease;
@@ -520,7 +520,10 @@ textarea, input, button{font-family:inherit;}
   background: var(--error);
   border: 1px solid var(--error-stroke);
 }
-.preview-panel{margin-top:0;}
+.preview-panel{
+  margin-top:0;
+  flex:1;
+}
 .preview-head{
   display:flex;
   align-items:center;
@@ -700,10 +703,11 @@ textarea, input, button{font-family:inherit;}
   overflow:auto;
   flex:1;
   max-height:none;
+  min-height:clamp(620px, 80vh, 1040px);
 }
 .preview-frame{
   width:100%;
-  height:auto;
+  height:clamp(620px, 80vh, 1040px);
   flex:1;
   min-height:0;
   border:none;

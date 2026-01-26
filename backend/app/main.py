@@ -145,6 +145,35 @@ frontend_origin = os.getenv("FRONTEND_ORIGIN", "").strip()
 if frontend_origin:
     _allowed_origins.append(frontend_origin)
 
+EXPERIENCE_SECTION_NAMES = [
+    "Experience",
+    "Professional Experience",
+    "Work Experience",
+    "Industrial Experience",
+    "Employment",
+    "Professional History",
+    "Work History",
+]
+SKILLS_SECTION_NAMES = [
+    "Skills",
+    "Technical Skills",
+    "Core Skills",
+    "Core Competencies",
+    "Technologies",
+    "Tech Stack",
+    "Tools",
+    "Skills & Tools",
+    "Skills and Tools",
+]
+PROJECTS_SECTION_NAMES = [
+    "Projects",
+    "Personal Projects",
+    "Academic Projects",
+    "Project Experience",
+    "Relevant Projects",
+    "Selected Projects",
+]
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_allowed_origins,
@@ -238,12 +267,16 @@ class DraftApplyItem(BaseModel):
     id: str
     text: str
     experience_id: Optional[str] = None
+    project_id: Optional[str] = None
 
 
 class DraftApplyRequest(BaseModel):
     titles: Optional[List[DraftApplyItem]] = None
     companies: Optional[List[DraftApplyItem]] = None
     bullets: Optional[List[DraftApplyItem]] = None
+    project_titles: Optional[List[DraftApplyItem]] = None
+    project_dates: Optional[List[DraftApplyItem]] = None
+    project_bullets: Optional[List[DraftApplyItem]] = None
     skills: Optional[str] = None
 
 
@@ -391,16 +424,13 @@ def _parse_latex_resume_items(latex_text: str, keyword_hint: List[str]) -> List[
     Parse \\resumeItem{...} blocks grouped by \\resumeSubheading.
     Each group includes experience metadata and its bullet entries with ranges.
     """
-    section_match = re.search(r"\\section\*?\{Experience\}", latex_text, re.IGNORECASE)
-    if not section_match:
+    section_range = _section_range_any_of(latex_text, EXPERIENCE_SECTION_NAMES)
+    if not section_range:
         raise HTTPException(
             status_code=400,
-            detail="No \\section{Experience} found in this LaTeX template.",
+            detail="No Experience section found (e.g., Experience, Professional Experience, Work Experience).",
         )
-    section_start = section_match.start()
-    rest = latex_text[section_match.end():]
-    next_section = re.search(r"\\section\*?\{", rest)
-    section_end = section_match.end() + (next_section.start() if next_section else len(rest))
+    section_start, section_end = section_range
 
     education_range = _latex_section_range(latex_text, "Education")
     subheadings, _ = _parse_latex_resume_subheadings(latex_text)
@@ -523,6 +553,20 @@ def _section_range_any(latex: str, section_name: str) -> Optional[Tuple[int, int
     return (body_start, min(candidates))
 
 
+def _section_range_any_of(latex: str, section_names: List[str]) -> Optional[Tuple[int, int]]:
+    for name in section_names:
+        match = re.search(rf"\\section\*?\{{{re.escape(name)}\}}", latex, re.IGNORECASE)
+        if not match:
+            continue
+        body_start = match.end()
+        rest = latex[body_start:]
+        next_section = re.search(r"\\section\*?\{", rest)
+        if not next_section:
+            return (body_start, len(latex))
+        return (body_start, body_start + next_section.start())
+    return None
+
+
 def _scan_resume_items(latex_text: str, start: int, end: int) -> List[Dict[str, object]]:
     bullets: List[Dict[str, object]] = []
     scan_idx = start
@@ -557,11 +601,11 @@ def _scan_resume_items(latex_text: str, start: int, end: int) -> List[Dict[str, 
 
 
 def _parse_experience_groups(latex_text: str) -> List[Dict[str, object]]:
-    section_range = _section_range_any(latex_text, "Experience")
+    section_range = _section_range_any_of(latex_text, EXPERIENCE_SECTION_NAMES)
     if not section_range:
         raise HTTPException(
             status_code=400,
-            detail="No \\section{Experience} found in this LaTeX template.",
+            detail="No Experience section found (e.g., Experience, Professional Experience, Work Experience).",
         )
     section_start, section_end = section_range
     subheadings, title_ranges = _parse_latex_resume_subheadings(latex_text)
@@ -611,7 +655,7 @@ def _parse_experience_groups(latex_text: str) -> List[Dict[str, object]]:
 
 
 def _parse_project_groups(latex_text: str) -> List[Dict[str, object]]:
-    section_range = _section_range_any(latex_text, "Projects")
+    section_range = _section_range_any_of(latex_text, PROJECTS_SECTION_NAMES)
     if not section_range:
         return []
     section_start, section_end = section_range
@@ -630,6 +674,7 @@ def _parse_project_groups(latex_text: str) -> List[Dict[str, object]]:
             idx = i
             continue
         fields: List[str] = []
+        field_ranges: List[Tuple[int, int]] = []
         parse_failed = False
         for _ in range(2):
             if i >= len(latex_text) or latex_text[i] != "{":
@@ -650,6 +695,7 @@ def _parse_project_groups(latex_text: str) -> List[Dict[str, object]]:
                 break
             content_end = j - 1
             fields.append(latex_text[content_start:content_end].strip())
+            field_ranges.append((content_start, content_end))
             i = j
             while i < len(latex_text) and latex_text[i].isspace():
                 i += 1
@@ -658,6 +704,8 @@ def _parse_project_groups(latex_text: str) -> List[Dict[str, object]]:
                 {
                     "name": fields[0],
                     "dates": fields[1],
+                    "name_range": field_ranges[0],
+                    "dates_range": field_ranges[1],
                     "block_start": start,
                     "block_end": i,
                 }
@@ -689,10 +737,22 @@ def _parse_project_groups(latex_text: str) -> List[Dict[str, object]]:
         if idx + 1 < len(headings):
             next_start = int(headings[idx + 1].get("block_start", len(latex_text)))
         boundary = min(next_start or len(latex_text), section_end)
-        bullets = _scan_resume_items(latex_text, block_end, boundary)
+        bullets = []
+        for b_idx, bullet in enumerate(_scan_resume_items(latex_text, block_end, boundary)):
+            bullets.append(
+                {
+                    "id": f"pj{idx}_{b_idx}",
+                    "text": bullet.get("text", ""),
+                    "range": bullet.get("range", (0, 0)),
+                }
+            )
         groups.append(
             {
+                "project_id": f"pj{idx}",
                 "name": str(heading.get("name", "")),
+                "dates": str(heading.get("dates", "")),
+                "name_range": heading.get("name_range"),
+                "dates_range": heading.get("dates_range"),
                 "bullets": bullets,
             }
         )
@@ -786,6 +846,22 @@ def _parse_latex_resume_subheadings(latex_text: str) -> Tuple[List[Dict[str, obj
     Deterministically parse \\resumeSubheading{...}{...}{...}{...} blocks using brace depth tracking.
     Returns subheading dicts and (start, end) indices for the title content only.
     """
+    def _looks_like_date_range(text: str) -> bool:
+        if not text:
+            return False
+        lowered = text.lower()
+        months = [
+            "jan", "feb", "mar", "apr", "may", "jun",
+            "jul", "aug", "sep", "sept", "oct", "nov", "dec",
+        ]
+        if any(m in lowered for m in months):
+            return True
+        if any(token in lowered for token in ["present", "current"]):
+            return True
+        if re.search(r"\b(19|20)\d{2}\b", lowered) and re.search(r"[-–—]|to", lowered):
+            return True
+        return False
+
     subheadings: List[Dict[str, object]] = []
     ranges: List[Tuple[int, int]] = []
     idx = 0
@@ -829,15 +905,29 @@ def _parse_latex_resume_subheadings(latex_text: str) -> Tuple[List[Dict[str, obj
                 i += 1
 
         if not parse_failed and len(fields) == 4:
+            title_field = fields[2]
+            company_field = fields[0]
+            dates_field = fields[3]
+            location_field = fields[1]
             title_start, title_end = field_ranges[2]
             company_start, company_end = field_ranges[0]
+
+            if _looks_like_date_range(fields[1]) and not _looks_like_date_range(fields[3]):
+                # Handle templates that use {Title}{Dates}{Company}{Location}.
+                title_field = fields[0]
+                company_field = fields[2]
+                dates_field = fields[1]
+                location_field = fields[3]
+                title_start, title_end = field_ranges[0]
+                company_start, company_end = field_ranges[2]
+
             subheadings.append(
                 {
                     "id": f"lhs{len(subheadings)}",
-                    "company": fields[0],
-                    "location": fields[1],
-                    "title": fields[2],
-                    "dates": fields[3],
+                    "company": company_field,
+                    "location": location_field,
+                    "title": title_field,
+                    "dates": dates_field,
                     "title_range": [title_start, title_end],
                     "company_range": [company_start, company_end],
                     "block_start": start,
@@ -864,16 +954,16 @@ def _parse_latex_skills_section(latex_text: str) -> Optional[Tuple[int, int, str
     Extract the technical skills section content inside the first \\item{...} within its itemize block.
     Returns (start, end, text) or None if not found.
     """
-    m = re.search(r"\\section\*?\{(Technical Skills|Skills)\}", latex_text)
-    if not m:
+    section_range = _section_range_any_of(latex_text, SKILLS_SECTION_NAMES)
+    if not section_range:
         return None
-    section_start = m.end()
-    rest = latex_text[section_start:]
+    section_start, section_end = section_range
+    rest = latex_text[section_start:section_end]
 
     begin_itemize = re.search(r"\\begin\{itemize\}(?:\[[^\]]*\])?", rest)
     if begin_itemize:
         content_start = section_start + begin_itemize.end()
-        after_begin = latex_text[content_start:]
+        after_begin = latex_text[content_start:section_end]
         end_itemize = re.search(r"\\end\{itemize\}", after_begin)
         if end_itemize:
             itemize_block = after_begin[:end_itemize.start()]
@@ -894,14 +984,6 @@ def _parse_latex_skills_section(latex_text: str) -> Optional[Tuple[int, int, str
                     text = latex_text[item_content_start:item_content_end].strip()
                     return (item_content_start, item_content_end, text)
 
-    next_section = re.search(r"\\section\*?\{", rest)
-    end_doc = re.search(r"\\end\{document\}", rest)
-    if next_section:
-        section_end = section_start + next_section.start()
-    elif end_doc:
-        section_end = section_start + end_doc.start()
-    else:
-        section_end = section_start + len(rest)
     text = latex_text[section_start:section_end].strip()
     return (section_start, section_end, text)
 
@@ -1483,7 +1565,7 @@ def _call_openai_rewrite_bullets_only(
         "7) Include ALL major job-description keywords explicitly; prefer stronger keyword density over subtlety.\n"
         "8) Quantify results wherever plausible.\n"
         "9) Bullets should be story-driven but compact; remove filler to make room for keywords.\n"
-        "10) Preserve the essence of each experience based on the 'context' field (e.g., lab/retail/marketplace/supply chain).\n"
+        "10) Preserve the essence of each experience (e.g., lab/retail/marketplace/supply chain context).\n"
         "11) Return ONLY plain text - NO LaTeX commands, NO backslashes, NO special characters like \\textbf.\n"
         "12) Apply the requested risk_level to keyword density and reframing; do NOT change seniority.\n"
         "\n"
@@ -1503,7 +1585,7 @@ def _call_openai_rewrite_bullets_only(
             {"role": "user", "content": json.dumps(payload)},
         ],
         response_format={"type": "json_object"},
-        temperature=0.6,
+        temperature=0.8,
     )
 
     text = (resp.choices[0].message.content or "").strip()
@@ -2333,10 +2415,13 @@ async def optimize(
             for bullet in exp.get("bullets", []):
                 bid = str(bullet.get("id", ""))
                 text = str(bullet.get("text", ""))
+                ai_text = _sanitize_latex_bullet(text).replace("{", "").replace("}", "").strip()
+                if not ai_text:
+                    ai_text = re.sub(r"[{}]", "", text).strip()
                 bullets_for_ai.append(
                     {
                         "id": bid,
-                        "text": text,
+                        "text": ai_text,
                         "context": context,
                         "max_chars": min(135, max(len(text) + 10, 80)),
                     }
@@ -2411,6 +2496,10 @@ async def optimize(
             updated_experiences = _parse_experience_groups(updated_latex)
         except HTTPException:
             updated_experiences = experiences
+        try:
+            updated_projects = _parse_project_groups(updated_latex)
+        except HTTPException:
+            updated_projects = []
         resume.optimized_latex = updated_latex
         try:
             db.commit()
@@ -2435,6 +2524,31 @@ async def optimize(
                         "experience_id": exp_id,
                     }
                 )
+        draft_project_titles: List[Dict[str, str]] = []
+        draft_project_dates: List[Dict[str, str]] = []
+        draft_project_bullets: List[Dict[str, str]] = []
+        for proj in updated_projects:
+            proj_id = str(proj.get("project_id", ""))
+            draft_project_titles.append(
+                {
+                    "id": proj_id,
+                    "text": str(proj.get("name", "")).strip(),
+                }
+            )
+            draft_project_dates.append(
+                {
+                    "id": proj_id,
+                    "text": str(proj.get("dates", "")).strip(),
+                }
+            )
+            for bullet in proj.get("bullets", []):
+                draft_project_bullets.append(
+                    {
+                        "id": str(bullet.get("id", "")),
+                        "text": str(bullet.get("text", "")).strip(),
+                        "project_id": proj_id,
+                    }
+                )
         payload = {
             "tex_base64": base64.b64encode(updated_latex.encode("utf-8")).decode("utf-8"),
             "pdf_base64": base64.b64encode(pdf_bytes).decode("utf-8"),
@@ -2453,6 +2567,9 @@ async def optimize(
                 "titles": [{"id": t.get("id", ""), "text": t.get("updated_title", "")} for t in updated_title_meta],
                 "companies": [{"id": t.get("id", ""), "text": t.get("company", "")} for t in updated_title_meta],
                 "bullets": draft_bullets,
+                "project_titles": draft_project_titles,
+                "project_dates": draft_project_dates,
+                "project_bullets": draft_project_bullets,
                 "skills": rewritten_skills or (skills_parsed[2] if skills_parsed else ""),
             },
         }
@@ -2481,9 +2598,20 @@ async def apply_draft_edits(
     title_edits = {t.id: t.text for t in (payload.titles or [])}
     company_edits = {c.id: c.text for c in (payload.companies or [])}
     bullet_edits = {b.id: b for b in (payload.bullets or [])}
+    project_title_edits = {t.id: t.text for t in (payload.project_titles or [])}
+    project_date_edits = {d.id: d.text for d in (payload.project_dates or [])}
+    project_bullet_edits = {b.id: b for b in (payload.project_bullets or [])}
     skills_edit = payload.skills
 
-    if not title_edits and not company_edits and not bullet_edits and skills_edit is None:
+    if (
+        not title_edits
+        and not company_edits
+        and not bullet_edits
+        and not project_title_edits
+        and not project_date_edits
+        and not project_bullet_edits
+        and skills_edit is None
+    ):
         raise HTTPException(status_code=400, detail="No draft edits provided.")
 
     title_map: Dict[str, Tuple[Dict[str, object], Tuple[int, int]]] = {}
@@ -2516,13 +2644,49 @@ async def apply_draft_edits(
                 bullet_ranges[bid] = (start, end, exp_id)
         if not bullet_ranges:
             raise HTTPException(status_code=400, detail="No stored bullet ranges. Re-run optimize.")
+    project_title_ranges: Dict[str, Tuple[int, int]] = {}
+    project_date_ranges: Dict[str, Tuple[int, int]] = {}
+    project_bullet_ranges: Dict[str, Tuple[int, int, Optional[str]]] = {}
+    if project_title_edits or project_date_edits or project_bullet_edits:
+        projects = _parse_project_groups(baseline)
+        if not projects:
+            raise HTTPException(status_code=400, detail="No Projects section found in this LaTeX template.")
+        for proj in projects:
+            proj_id = str(proj.get("project_id", ""))
+            name_range = proj.get("name_range")
+            dates_range = proj.get("dates_range")
+            if isinstance(name_range, (list, tuple)) and len(name_range) == 2:
+                project_title_ranges[proj_id] = (int(name_range[0]), int(name_range[1]))
+            if isinstance(dates_range, (list, tuple)) and len(dates_range) == 2:
+                project_date_ranges[proj_id] = (int(dates_range[0]), int(dates_range[1]))
+            for bullet in proj.get("bullets", []):
+                bid = str(bullet.get("id", ""))
+                start, end = bullet.get("range", (0, 0))
+                project_bullet_ranges[bid] = (start, end, proj_id)
     skills = _parse_latex_skills_section(baseline)
 
     unknown_titles = [tid for tid in title_edits if tid not in title_map]
     unknown_companies = [cid for cid in company_edits if cid not in title_map]
     unknown_bullets = [bid for bid in bullet_edits if bid not in bullet_ranges]
-    if unknown_titles or unknown_companies or unknown_bullets:
-        missing = ", ".join(unknown_titles + unknown_companies + unknown_bullets)
+    unknown_project_titles = [pid for pid in project_title_edits if pid not in project_title_ranges]
+    unknown_project_dates = [pid for pid in project_date_edits if pid not in project_date_ranges]
+    unknown_project_bullets = [bid for bid in project_bullet_edits if bid not in project_bullet_ranges]
+    if (
+        unknown_titles
+        or unknown_companies
+        or unknown_bullets
+        or unknown_project_titles
+        or unknown_project_dates
+        or unknown_project_bullets
+    ):
+        missing = ", ".join(
+            unknown_titles
+            + unknown_companies
+            + unknown_bullets
+            + unknown_project_titles
+            + unknown_project_dates
+            + unknown_project_bullets
+        )
         raise HTTPException(status_code=400, detail=f"Unknown draft ids: {missing}")
 
     replacements: List[Tuple[int, int, str]] = []
@@ -2559,6 +2723,36 @@ async def apply_draft_edits(
         cleaned = _replace_unicode_artifacts(cleaned)
         if len(cleaned) > 180:
             raise HTTPException(status_code=400, detail="Bullet edits must be <= 180 characters.")
+        sanitized = _sanitize_latex_bullet(cleaned)
+        escaped = _escape_latex(sanitized if sanitized.strip() else cleaned)
+        replacements.append((start, end, escaped))
+
+    for pid, text in project_title_edits.items():
+        cleaned = text.replace("\n", " ").strip()
+        if len(cleaned) > 200:
+            raise HTTPException(status_code=400, detail="Project title edits must be <= 200 characters.")
+        start, end = project_title_ranges[pid]
+        original_raw = baseline[start:end]
+        replacements.append((start, end, _format_title_replacement(original_raw, cleaned)))
+
+    for pid, text in project_date_edits.items():
+        cleaned = text.replace("\n", " ").strip()
+        if len(cleaned) > 200:
+            raise HTTPException(status_code=400, detail="Project date edits must be <= 200 characters.")
+        start, end = project_date_ranges[pid]
+        original_raw = baseline[start:end]
+        replacements.append((start, end, _format_title_replacement(original_raw, cleaned)))
+
+    for bid, edit in project_bullet_edits.items():
+        proj_id = (edit.project_id or "").strip()
+        start, end, stored_proj = project_bullet_ranges[bid]
+        if not proj_id:
+            raise HTTPException(status_code=400, detail="Project bullet edits must include project_id.")
+        if stored_proj and proj_id != stored_proj:
+            raise HTTPException(status_code=400, detail=f"Project bullet project_id mismatch for {bid}.")
+        text = edit.text
+        cleaned = text.replace("\n", " ").strip()
+        cleaned = _replace_unicode_artifacts(cleaned)
         sanitized = _sanitize_latex_bullet(cleaned)
         escaped = _escape_latex(sanitized if sanitized.strip() else cleaned)
         replacements.append((start, end, escaped))
