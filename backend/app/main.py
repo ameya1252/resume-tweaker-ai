@@ -242,6 +242,7 @@ COVER_LETTER_BODY_INSTRUCTIONS = (
 class GoogleDocOptimizeRequest(BaseModel):
     doc_id: str
     job_description: str
+    risk_level: str = "balanced"
 
 
 class CoverLetterRequest(BaseModel):
@@ -373,15 +374,50 @@ def _get_google_creds() -> Credentials:
     return Credentials(**_google_creds_data)
 
 
+def _google_doc_section_type(text: str) -> Optional[str]:
+    normalized = text.strip().lower()
+    if normalized in {name.lower() for name in EXPERIENCE_SECTION_NAMES}:
+        return "experience"
+    if normalized in {name.lower() for name in PROJECTS_SECTION_NAMES}:
+        return "projects"
+    if normalized in {name.lower() for name in SKILLS_SECTION_NAMES}:
+        return "skills"
+    return None
+
+
+def _looks_like_section_heading(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return False
+    if len(stripped) > 60:
+        return False
+    letters = [ch for ch in stripped if ch.isalpha()]
+    if letters and all(ch.isupper() for ch in letters):
+        return True
+    common = {
+        "honors",
+        "awards",
+        "certifications",
+        "publications",
+        "achievements",
+        "leadership",
+        "activities",
+        "education",
+        "experience",
+        "projects",
+        "skills",
+    }
+    return stripped.lower() in common
+
+
 def _extract_google_doc_slots(doc: dict, keyword_hint: List[str]) -> Tuple[List[Slot], List[Tuple[int, int]]]:
     slots: List[Slot] = []
     ranges: List[Tuple[int, int]] = []
+    current_section: Optional[str] = None
 
     for element in doc.get("body", {}).get("content", []):
         para = element.get("paragraph")
         if not para:
-            continue
-        if not para.get("bullet"):
             continue
 
         parts: List[str] = []
@@ -391,6 +427,17 @@ def _extract_google_doc_slots(doc: dict, keyword_hint: List[str]) -> Tuple[List[
                 parts.append(tr["content"])
         txt = "".join(parts).strip()
         if not txt:
+            continue
+
+        if not para.get("bullet"):
+            section_type = _google_doc_section_type(txt)
+            if section_type:
+                current_section = section_type
+            continue
+
+        if current_section == "projects":
+            continue
+        if current_section not in {"experience", "skills"}:
             continue
 
         start_index = element.get("startIndex")
@@ -417,6 +464,55 @@ def _extract_google_doc_slots(doc: dict, keyword_hint: List[str]) -> Tuple[List[
         raise HTTPException(status_code=400, detail="No bullet paragraphs found in this Google Doc.")
 
     return slots, ranges
+
+
+def _extract_google_doc_skills_block(doc: dict) -> Optional[Tuple[str, int, int]]:
+    current_section: Optional[str] = None
+    buffer: List[str] = []
+    start_index: Optional[int] = None
+    end_index: Optional[int] = None
+
+    for element in doc.get("body", {}).get("content", []):
+        para = element.get("paragraph")
+        if not para:
+            continue
+
+        parts: List[str] = []
+        for pe in para.get("elements", []):
+            tr = pe.get("textRun")
+            if tr and "content" in tr:
+                parts.append(tr["content"])
+        txt = "".join(parts).strip()
+        if not txt:
+            continue
+
+        if not para.get("bullet"):
+            section_type = _google_doc_section_type(txt)
+            if section_type:
+                if current_section == "skills" and buffer:
+                    break
+                current_section = section_type
+                continue
+            if current_section == "skills" and _looks_like_section_heading(txt):
+                break
+
+        if current_section != "skills":
+            continue
+        if para.get("bullet"):
+            continue
+
+        start = element.get("startIndex")
+        end = element.get("endIndex")
+        if start is None or end is None or end <= start:
+            continue
+        if start_index is None:
+            start_index = start
+        end_index = end
+        buffer.append(txt)
+
+    if not buffer or start_index is None or end_index is None:
+        return None
+    return ("\n".join(buffer).strip(), start_index, end_index)
 
 
 def _parse_latex_resume_items(latex_text: str, keyword_hint: List[str]) -> List[Dict[str, object]]:
@@ -1751,6 +1847,69 @@ def _call_openai_rewrite_skills(
     return new_skills
 
 
+def _call_openai_rewrite_skills_plain(
+    job_description: str,
+    current_skills: str,
+    max_chars: int = 1000,
+    target_lines: Optional[int] = None,
+) -> str:
+    """
+    AI rewrites skills section in plain text (no LaTeX). Returns new skills text.
+    """
+    if client is None:
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set")
+
+    line_rule = ""
+    if target_lines:
+        line_rule = f"3) Use EXACTLY {target_lines} lines, separated by newlines.\n"
+    instructions = (
+        "You are a resume skills section optimizer.\n"
+        "Goal: reorder and adjust skills to highlight those most relevant to the job description.\n"
+        "\n"
+        "Rules (STRICT):\n"
+        "1) Return JSON ONLY: {\"skills\":\"...\"}\n"
+        f"2) Skills text MUST be <= {max_chars} characters.\n"
+        f"{line_rule}"
+        "4) Use clear category lines like: Category: skill1, skill2, skill3\n"
+        "5) Keep content concise and relevant to the job description.\n"
+        "6) No LaTeX commands or markdown.\n"
+    )
+
+    payload = {
+        "job_description": job_description,
+        "skills": current_skills,
+    }
+
+    resp = client.chat.completions.create(
+        model=OPENAI_MODEL_RESUME,
+        messages=[
+            {"role": "system", "content": instructions},
+            {"role": "user", "content": json.dumps(payload)},
+        ],
+        response_format={"type": "json_object"},
+        temperature=0.2,
+    )
+
+    text = (resp.choices[0].message.content or "").strip()
+    if not text:
+        return current_skills
+
+    try:
+        data = json.loads(text)
+    except Exception:
+        m = re.search(r"\{.*\}", text, re.DOTALL)
+        if not m:
+            return current_skills
+        data = json.loads(m.group(0))
+
+    new_skills = str(data.get("skills", "")).replace("\r", "").strip()
+    if not new_skills:
+        return current_skills
+    if len(new_skills) > max_chars:
+        new_skills = new_skills[:max_chars].rstrip()
+    return new_skills
+
+
 def _call_openai_greeting(job_description: str) -> str:
     if client is None:
         raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set in backend/.env")
@@ -2328,15 +2487,52 @@ def optimize_google_doc(payload: GoogleDocOptimizeRequest):
     doc = docs.documents().get(documentId=payload.doc_id).execute()
     keyword_hint = _extract_keywords_from_jd(payload.job_description)
     slots, ranges = _extract_google_doc_slots(doc, keyword_hint)
+    skills_block = _extract_google_doc_skills_block(doc)
 
-    results = _call_openai(payload.job_description, slots)
-    res_by_id = {r.id: r.updated_text for r in results}
+    bullets_for_ai: List[Dict[str, str]] = []
+    for slot in slots:
+        bullets_for_ai.append(
+            {
+                "id": slot.id,
+                "text": slot.text,
+                "context": "",
+                "max_chars": slot.max_chars,
+            }
+        )
 
-    requests = []
-    for slot, (start_idx, end_idx) in sorted(zip(slots, ranges), key=lambda x: x[1][0], reverse=True):
-        new_text = res_by_id.get(slot.id, slot.text)
+    rewritten_bullets = _call_openai_rewrite_bullets_only(
+        payload.job_description,
+        bullets_for_ai,
+        risk_level=payload.risk_level or "balanced",
+    )
+
+    replacements: List[Tuple[int, int, str, Optional[List[Tuple[int, int]]]]] = []
+    for slot, (start_idx, end_idx) in zip(slots, ranges):
+        new_text = rewritten_bullets.get(slot.id, slot.text)
         if not new_text:
             continue
+        replacements.append((start_idx, end_idx, new_text, None))
+
+    if skills_block:
+        skills_text, skills_start, skills_end = skills_block
+        line_count = len([line for line in skills_text.splitlines() if line.strip()])
+        rewritten_skills = _call_openai_rewrite_skills_plain(
+            payload.job_description,
+            skills_text,
+            target_lines=line_count if line_count else None,
+        )
+        if rewritten_skills:
+            heading_ranges: List[Tuple[int, int]] = []
+            offset = 0
+            for line in rewritten_skills.splitlines():
+                colon_idx = line.find(":")
+                if colon_idx > 0:
+                    heading_ranges.append((offset, offset + colon_idx + 1))
+                offset += len(line) + 1
+            replacements.append((skills_start, skills_end, rewritten_skills, heading_ranges))
+
+    requests = []
+    for start_idx, end_idx, new_text, heading_ranges in sorted(replacements, key=lambda x: x[0], reverse=True):
         # end_idx includes the paragraph newline; keep it
         requests.append({
             "deleteContentRange": {
@@ -2352,11 +2548,33 @@ def optimize_google_doc(payload: GoogleDocOptimizeRequest):
                 "text": new_text,
             }
         })
+        if heading_ranges is not None:
+            skills_end_idx = start_idx + len(new_text)
+            requests.append({
+                "updateTextStyle": {
+                    "range": {"startIndex": start_idx, "endIndex": skills_end_idx},
+                    "textStyle": {"bold": False},
+                    "fields": "bold",
+                }
+            })
+            for rel_start, rel_end in heading_ranges:
+                if rel_start >= rel_end:
+                    continue
+                requests.append({
+                    "updateTextStyle": {
+                        "range": {
+                            "startIndex": start_idx + rel_start,
+                            "endIndex": start_idx + rel_end,
+                        },
+                        "textStyle": {"bold": True},
+                        "fields": "bold",
+                    }
+                })
 
     if requests:
         docs.documents().batchUpdate(documentId=payload.doc_id, body={"requests": requests}).execute()
 
-    return {"ok": True, "bullets_edited": len(results), "keyword_hints": keyword_hint}
+    return {"ok": True, "bullets_edited": len(rewritten_bullets), "keyword_hints": keyword_hint}
 
 
 @app.post("/google/coverletter")

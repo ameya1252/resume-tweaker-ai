@@ -1161,6 +1161,9 @@ export default function App() {
                 <button className={`chip ${mode === 'latex' ? 'active' : ''}`} onClick={() => handleModeChange('latex')}>
                   LaTeX Template
                 </button>
+                <button className={`chip ${mode === 'gdocs' ? 'active' : ''}`} onClick={() => handleModeChange('gdocs')}>
+                  Google Docs
+                </button>
               </div>
 
               {mode === 'latex' ? (
