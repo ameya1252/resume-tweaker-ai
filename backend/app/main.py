@@ -5,9 +5,10 @@ import os
 import re
 import subprocess
 import tempfile
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 from urllib.parse import quote
 
 from dotenv import load_dotenv
@@ -52,6 +53,8 @@ if not OPENAI_API_KEY:
 
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
+USE_LATEXMK = True
+
 GOOGLE_SCOPES = [
     "https://www.googleapis.com/auth/documents",
     "https://www.googleapis.com/auth/drive.readonly",
@@ -88,6 +91,29 @@ def _validate_google_env() -> None:
         raise RuntimeError("GOOGLE_CLIENT_TYPE must be 'web' or 'installed'.")
 
 
+def _validate_latexmk_installed() -> None:
+    global USE_LATEXMK
+    try:
+        result = subprocess.run(
+            ["latexmk", "--version"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=5,
+        )
+    except FileNotFoundError:
+        logger.warning("latexmk not found, falling back to pdflatex")
+        USE_LATEXMK = False
+        return
+    except Exception:
+        logger.warning("latexmk not found, falling back to pdflatex")
+        USE_LATEXMK = False
+        return
+
+    if result.returncode != 0:
+        logger.warning("latexmk not found, falling back to pdflatex")
+        USE_LATEXMK = False
+
+
 # Fail fast on bad OAuth env (only when Google Docs mode is used).
 if any([GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REDIRECT_URI]):
     _validate_google_env()
@@ -106,6 +132,7 @@ app = FastAPI(title="Resume Tweaker AI (Personal)", version="0.1.0")
 def validate_database_url() -> None:
     if not os.getenv("DATABASE_URL", "").strip():
         raise RuntimeError("DATABASE_URL is not set. Configure it before starting the server.")
+    _validate_latexmk_installed()
 
 
 _allowed_origins = [
@@ -146,6 +173,17 @@ class OptimizeResult(BaseModel):
 
 class CoverLetterResult(BaseModel):
     cover_letter: str
+
+
+class CompilationResult(BaseModel):
+    success: bool
+    pdf_bytes: Optional[bytes] = None
+    log_content: Optional[str] = None
+    warnings: List[str] = Field(default_factory=list)
+    errors: List[str] = Field(default_factory=list)
+    latex_errors: List[Dict[str, Optional[Union[int, str]]]] = Field(default_factory=list)
+    passes: int = 0
+
 
 COVER_LETTER_INSTRUCTIONS = (
     "You are a cover letter writing engine.\n"
@@ -1448,7 +1486,6 @@ def _call_openai_rewrite_bullets_only(
         "10) Preserve the essence of each experience based on the 'context' field (e.g., lab/retail/marketplace/supply chain).\n"
         "11) Return ONLY plain text - NO LaTeX commands, NO backslashes, NO special characters like \\textbf.\n"
         "12) Apply the requested risk_level to keyword density and reframing; do NOT change seniority.\n"
-        "13) If a bullet cannot be improved, return the original text unchanged.\n"
         "\n"
         "CRITICAL: You are ONLY rewriting bullet text. Do NOT return titles, companies, dates, or any structure.\n"
     )
@@ -1466,7 +1503,7 @@ def _call_openai_rewrite_bullets_only(
             {"role": "user", "content": json.dumps(payload)},
         ],
         response_format={"type": "json_object"},
-        temperature=0.35,
+        temperature=0.6,
     )
 
     text = (resp.choices[0].message.content or "").strip()
@@ -1579,10 +1616,9 @@ def _call_openai_rewrite_skills(
         "4) Format EACH category as: \\textbf{Category:} skill1, skill2, skill3\n"
         "5) Separate categories with ' \\\\\\\\ ' (that's 4 backslashes for LaTeX line break).\n"
         "6) Prioritize skills mentioned in the job description.\n"
-        "7) Do NOT invent skills the person doesn't have - only reorder/emphasize.\n"
-        "8) NO trailing dashes, pipes, or em dashes.\n"
-        "9) Each category name should NOT contain '&' - use 'and' instead.\n"
-        "10) Keep category names SHORT (1-2 words max, like 'Languages', 'Backend', 'Cloud').\n"
+        "7) NO trailing dashes, pipes, or em dashes.\n"
+        "8) Each category name should NOT contain '&' - use 'and' instead.\n"
+        "9) Keep category names SHORT (1-2 words max, like 'Languages', 'Backend', 'Cloud').\n"
         "\n"
         "Example output format:\n"
         "\\textbf{Languages:} Python, Java, SQL \\\\\\\\ \\textbf{Backend:} FastAPI, Redis \\\\\\\\ \\textbf{Cloud:} AWS, Docker\n"
@@ -1781,33 +1817,211 @@ def _extract_latex_text(latex_text: str) -> str:
     return "\n".join(parts).strip()
 
 
-def _compile_latex_to_pdf_bytes(latex_text: str) -> bytes:
+def _format_error_summary(compile_result: CompilationResult) -> str:
+    if compile_result.latex_errors:
+        lines = ["LaTeX compilation failed:"]
+        for err in compile_result.latex_errors[:5]:
+            line_num = err.get("line_number")
+            msg = err.get("message", "Unknown error")
+            error_type = err.get("error_type", "")
+            if line_num:
+                lines.append(f"  - Line {line_num} ({error_type}): {msg}")
+            else:
+                lines.append(f"  - {error_type}: {msg}")
+        return "\n".join(lines)
+    if compile_result.log_content:
+        log_tail = compile_result.log_content[-1000:]
+        return f"LaTeX compilation failed.\n\nLog excerpt:\n{log_tail}"
+    return "LaTeX compilation failed. Please check your template syntax."
+
+
+def _compile_latex_to_pdf_bytes(latex_text: str, strict: bool = False) -> CompilationResult:
     with tempfile.TemporaryDirectory() as td:
         td_path = os.path.abspath(td)
         tex_path = os.path.join(td_path, "resume.tex")
         with open(tex_path, "w", encoding="utf-8") as f:
             f.write(latex_text)
 
-        try:
-            result = subprocess.run(
-                ["pdflatex", "-interaction=nonstopmode", "-halt-on-error", "resume.tex"],
-                cwd=td_path,
-                check=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=60,
-            )
-        except subprocess.CalledProcessError as exc:
-            err = exc.stdout.decode("utf-8", errors="ignore") + "\n" + exc.stderr.decode("utf-8", errors="ignore")
-            raise HTTPException(status_code=400, detail=f"LaTeX compilation failed:\n{err[-1200:]}")
-        except Exception as exc:
-            raise HTTPException(status_code=500, detail=f"LaTeX compilation error: {exc}")
+        def _read_log() -> str:
+            log_path = os.path.join(td_path, "resume.log")
+            if not os.path.exists(log_path):
+                return ""
+            try:
+                with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
+                    return f.read()
+            except OSError:
+                return ""
+
+        def _parse_log(log_content: str) -> Tuple[List[str], List[str], int]:
+            if not log_content:
+                return [], [], 0
+            lines = log_content.splitlines()
+            warnings = [line for line in lines if "Warning:" in line]
+            errors = [line for line in lines if "Error:" in line or "!" in line]
+            passes = log_content.count("Run number")
+            return warnings, errors, passes
+
+        def _parse_latex_errors(log_content: str) -> List[Dict[str, Optional[Union[int, str]]]]:
+            if not log_content:
+                return []
+            lines = log_content.splitlines()
+            results: List[Dict[str, Optional[Union[int, str]]]] = []
+            line_re = re.compile(r"l\.(\d+)")
+            package_re = re.compile(r"Package\s+(\S+)\s+Error:\s*(.*)")
+
+            for idx, line in enumerate(lines):
+                if not line.startswith("!"):
+                    continue
+                raw = line[1:].strip()
+                error_type = "Unknown error"
+                message = raw
+                if raw.startswith("Undefined control sequence"):
+                    error_type = "Undefined control sequence"
+                elif raw.startswith("Missing $ inserted"):
+                    error_type = "Missing $ inserted"
+                elif raw.startswith("Missing character"):
+                    error_type = "Missing character"
+                elif raw.startswith("LaTeX Error:"):
+                    error_type = "LaTeX Error"
+                    message = raw.replace("LaTeX Error:", "", 1).strip() or raw
+                elif raw.startswith("Package "):
+                    match = package_re.match(raw)
+                    error_type = "Package error"
+                    if match:
+                        pkg, detail = match.groups()
+                        message = f"{pkg}: {detail}".strip(": ").strip()
+
+                line_number = None
+                for lookahead in range(0, 3):
+                    if idx + lookahead >= len(lines):
+                        break
+                    match = line_re.search(lines[idx + lookahead])
+                    if match:
+                        line_number = int(match.group(1))
+                        break
+
+                results.append(
+                    {
+                        "line_number": line_number,
+                        "message": message,
+                        "error_type": error_type,
+                    }
+                )
+            return results
+
+        def _has_nontransient_error(log_content: str) -> bool:
+            if not log_content:
+                return False
+            lowered = log_content.lower()
+            nontransient_markers = [
+                "undefined control sequence",
+                "missing $ inserted",
+                "missing } inserted",
+                "extra }",
+                "runaway argument",
+                "file ended while scanning",
+                "latex error",
+                "emergency stop",
+            ]
+            return any(marker in lowered for marker in nontransient_markers)
+
+        def _should_retry(log_content: str, timeout_related: bool) -> bool:
+            if not timeout_related:
+                return False
+            if _has_nontransient_error(log_content):
+                return False
+            return True
+
+        if USE_LATEXMK:
+            command = ["latexmk", "-pdf", "-interaction=batchmode", "-f", "-cd", "resume.tex"]
+            tool_name = "latexmk"
+        else:
+            command = ["pdflatex", "-interaction=nonstopmode", "resume.tex"]
+            tool_name = "pdflatex"
+
+        max_retries = 2 if USE_LATEXMK else 0
+        timeout_seconds = 120
+        attempt = 0
+        last_log_content = ""
+        while True:
+            try:
+                result = subprocess.run(
+                    command,
+                    cwd=td_path,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=timeout_seconds,
+                )
+                if not USE_LATEXMK:
+                    subprocess.run(
+                        command,
+                        cwd=td_path,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        timeout=timeout_seconds,
+                    )
+                last_log_content = _read_log()
+                timeout_related = result.returncode in {124, 137}
+                if result.returncode != 0 and attempt < max_retries and _should_retry(
+                    last_log_content, timeout_related=timeout_related
+                ):
+                    attempt += 1
+                    time.sleep(1)
+                    continue
+                break
+            except subprocess.TimeoutExpired:
+                last_log_content = _read_log()
+                if attempt < max_retries and _should_retry(last_log_content, timeout_related=True):
+                    attempt += 1
+                    time.sleep(1)
+                    continue
+                warnings, errors, passes = _parse_log(last_log_content)
+                latex_errors = _parse_latex_errors(last_log_content)
+                errors.append(f"LaTeX compilation timed out after {timeout_seconds} seconds.")
+                return CompilationResult(
+                    success=False,
+                    log_content=last_log_content or None,
+                    warnings=warnings,
+                    errors=errors,
+                    latex_errors=latex_errors,
+                    passes=passes,
+                )
+            except Exception as exc:
+                last_log_content = _read_log()
+                warnings, errors, passes = _parse_log(last_log_content)
+                latex_errors = _parse_latex_errors(last_log_content)
+                errors.append(f"LaTeX compilation error: {exc}")
+                return CompilationResult(
+                    success=False,
+                    log_content=last_log_content or None,
+                    warnings=warnings,
+                    errors=errors,
+                    latex_errors=latex_errors,
+                    passes=passes,
+                )
 
         pdf_path = os.path.join(td_path, "resume.pdf")
-        if not os.path.exists(pdf_path):
-            raise HTTPException(status_code=500, detail="PDF output not found after pdflatex.")
-        with open(pdf_path, "rb") as f:
-            return f.read()
+        log_content = last_log_content or _read_log()
+        warnings, errors, passes = _parse_log(log_content)
+        latex_errors = _parse_latex_errors(log_content)
+        pdf_bytes = None
+        if os.path.exists(pdf_path):
+            with open(pdf_path, "rb") as f:
+                pdf_bytes = f.read()
+
+        success = pdf_bytes is not None and (not strict or not latex_errors)
+        if pdf_bytes is None:
+            errors.append(f"PDF output not found after {tool_name}.")
+
+        return CompilationResult(
+            success=success,
+            pdf_bytes=pdf_bytes,
+            log_content=log_content or None,
+            warnings=warnings,
+            errors=errors,
+            latex_errors=latex_errors,
+            passes=passes,
+        )
 
 
 @app.get("/health")
@@ -2129,21 +2343,6 @@ async def optimize(
                 )
                 bullet_ranges[bid] = bullet.get("range", (0, 0))
 
-        for idx, proj in enumerate(projects):
-            context = f"Project: {proj.get('name', '')}"
-            for b_idx, bullet in enumerate(proj.get("bullets", [])):
-                bid = f"proj_{idx}_{b_idx}"
-                text = str(bullet.get("text", ""))
-                bullets_for_ai.append(
-                    {
-                        "id": bid,
-                        "text": text,
-                        "context": context,
-                        "max_chars": min(135, max(len(text) + 10, 80)),
-                    }
-                )
-                bullet_ranges[bid] = bullet.get("range", (0, 0))
-
         titles_for_ai: List[Dict[str, str]] = []
         for exp in experiences:
             exp_id = str(exp.get("experience_id", ""))
@@ -2219,7 +2418,10 @@ async def optimize(
             db.rollback()
             logger.exception("Failed to save optimized resume: user_id=%s resume_id=%s", user.id, resume.id)
             raise HTTPException(status_code=500, detail="Could not save optimized resume.") from exc
-        pdf_bytes = _compile_latex_to_pdf_bytes(updated_latex)
+        compile_result = _compile_latex_to_pdf_bytes(updated_latex)
+        if not compile_result.pdf_bytes:
+            raise HTTPException(status_code=400, detail=_format_error_summary(compile_result))
+        pdf_bytes = compile_result.pdf_bytes
 
         import base64
         draft_bullets: List[Dict[str, str]] = []
@@ -2240,6 +2442,13 @@ async def optimize(
             "bullets_edited": bullets_edited,
             "keyword_hints": _extract_keywords_from_jd(job_description),
             "updated_titles": updated_title_meta,
+            "compilation": {
+                "has_warnings": bool(compile_result.warnings),
+                "has_errors": bool(compile_result.latex_errors),
+                "warnings": compile_result.warnings[:10],
+                "errors": compile_result.latex_errors[:10],
+                "passes": compile_result.passes,
+            },
             "draft": {
                 "titles": [{"id": t.get("id", ""), "text": t.get("updated_title", "")} for t in updated_title_meta],
                 "companies": [{"id": t.get("id", ""), "text": t.get("company", "")} for t in updated_title_meta],
@@ -2372,12 +2581,22 @@ async def apply_draft_edits(
         db.rollback()
         logger.exception("Failed to save optimized resume: user_id=%s resume_id=%s", user.id, resume.id)
         raise HTTPException(status_code=500, detail="Could not save optimized resume.") from exc
-    pdf_bytes = _compile_latex_to_pdf_bytes(updated_latex)
+    compile_result = _compile_latex_to_pdf_bytes(updated_latex)
+    if not compile_result.pdf_bytes:
+        raise HTTPException(status_code=400, detail=_format_error_summary(compile_result))
+    pdf_bytes = compile_result.pdf_bytes
 
     import base64
     return {
         "pdf_base64": base64.b64encode(pdf_bytes).decode("utf-8"),
         "pdf_available": True,
+        "compilation": {
+            "has_warnings": bool(compile_result.warnings),
+            "has_errors": bool(compile_result.latex_errors),
+            "warnings": compile_result.warnings[:10],
+            "errors": compile_result.latex_errors[:10],
+            "passes": compile_result.passes,
+        },
     }
 
 
