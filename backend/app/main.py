@@ -21,12 +21,13 @@ from pydantic import BaseModel, Field
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session as OrmSession
 from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request as GoogleRequest
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
-from db import SessionLocal
-from models import DownloadedResume, Resume
+from db import Base, SessionLocal, engine
+from models import DownloadedResume, GoogleCredential, GoogleOAuthState, Resume
 from models import Session as SessionModel
 from models import User
 
@@ -59,9 +60,6 @@ GOOGLE_SCOPES = [
     "https://www.googleapis.com/auth/documents",
     "https://www.googleapis.com/auth/drive.readonly",
 ]
-
-_google_state: Optional[str] = None
-_google_creds_data: Optional[Dict[str, str]] = None
 _request_cache: contextvars.ContextVar[Optional[Dict[str, object]]] = contextvars.ContextVar(
     "request_cache",
     default=None,
@@ -133,6 +131,7 @@ def validate_database_url() -> None:
     if not os.getenv("DATABASE_URL", "").strip():
         raise RuntimeError("DATABASE_URL is not set. Configure it before starting the server.")
     _validate_latexmk_installed()
+    Base.metadata.create_all(bind=engine)
 
 
 _allowed_origins = [
@@ -331,16 +330,9 @@ def create_session_token() -> str:
     return str(uuid.uuid4())
 
 
-def get_current_user(
-    authorization: Optional[str] = Header(None),
-    db: OrmSession = Depends(get_db),
-) -> User:
-    if not authorization or not authorization.lower().startswith("bearer "):
-        raise HTTPException(status_code=401, detail="Invalid authorization header.")
-    token = authorization.split(" ", 1)[1].strip()
+def _get_user_for_token(token: str, db: OrmSession) -> User:
     if not token:
-        raise HTTPException(status_code=401, detail="Invalid authorization header.")
-
+        raise HTTPException(status_code=401, detail="Invalid session token.")
     session = db.query(SessionModel).filter(SessionModel.token == token).first()
     if not session:
         raise HTTPException(status_code=401, detail="Session expired or invalid.")
@@ -360,6 +352,18 @@ def get_current_user(
     return user
 
 
+def get_current_user(
+    authorization: Optional[str] = Header(None),
+    db: OrmSession = Depends(get_db),
+) -> User:
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Invalid authorization header.")
+    token = authorization.split(" ", 1)[1].strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="Invalid authorization header.")
+    return _get_user_for_token(token, db)
+
+
 def _google_flow() -> Flow:
     if not (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and GOOGLE_REDIRECT_URI):
         raise HTTPException(status_code=500, detail="Google OAuth env vars are not set.")
@@ -377,10 +381,50 @@ def _google_flow() -> Flow:
     return Flow.from_client_config(config, scopes=GOOGLE_SCOPES, redirect_uri=GOOGLE_REDIRECT_URI)
 
 
-def _get_google_creds() -> Credentials:
-    if not _google_creds_data:
+def _get_google_creds(user: User, db: OrmSession) -> Credentials:
+    record = db.query(GoogleCredential).filter(GoogleCredential.user_id == user.id).first()
+    if not record:
         raise HTTPException(status_code=401, detail="Google account not connected.")
-    return Credentials(**_google_creds_data)
+    scopes = json.loads(record.scopes) if record.scopes else GOOGLE_SCOPES
+    creds = Credentials(
+        token=record.token,
+        refresh_token=record.refresh_token,
+        token_uri=record.token_uri,
+        client_id=record.client_id,
+        client_secret=record.client_secret,
+        scopes=scopes,
+    )
+    if record.expiry:
+        expiry = record.expiry
+        if expiry.tzinfo is not None:
+            expiry = expiry.astimezone(timezone.utc).replace(tzinfo=None)
+        creds.expiry = expiry
+    if not creds.valid:
+        if creds.expired and creds.refresh_token:
+            try:
+                creds.refresh(GoogleRequest())
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=401,
+                    detail="Google credentials expired. Reconnect your Google account.",
+                ) from exc
+            record.token = creds.token
+            record.expiry = creds.expiry
+            if creds.refresh_token:
+                record.refresh_token = creds.refresh_token
+            try:
+                db.add(record)
+                db.commit()
+            except SQLAlchemyError as exc:
+                db.rollback()
+                logger.exception("Failed to refresh Google token: user_id=%s", user.id)
+                raise HTTPException(status_code=500, detail="Could not refresh Google credentials.") from exc
+        else:
+            raise HTTPException(
+                status_code=401,
+                detail="Google credentials expired. Reconnect your Google account.",
+            )
+    return creds
 
 
 def _google_doc_section_type(text: str) -> Optional[str]:
@@ -2430,23 +2474,46 @@ async def set_latex_template(
     return {"ok": True, "message": "LaTeX template saved."}
 
 @app.get("/auth/google")
-def auth_google():
-    global _google_state
+def auth_google(session_token: str, db: OrmSession = Depends(get_db)):
+    user = _get_user_for_token(session_token, db)
     flow = _google_flow()
-    auth_url, state = flow.authorization_url(
+    state = str(uuid.uuid4())
+    now = datetime.now(timezone.utc)
+    expires_at = now + timedelta(minutes=10)
+    db.query(GoogleOAuthState).filter(GoogleOAuthState.expires_at < now).delete()
+    db.add(GoogleOAuthState(user_id=user.id, state=state, expires_at=expires_at))
+    try:
+        db.commit()
+    except SQLAlchemyError as exc:
+        db.rollback()
+        logger.exception("Failed to store Google OAuth state: user_id=%s", user.id)
+        raise HTTPException(status_code=500, detail="Could not start Google OAuth.") from exc
+    auth_url, _ = flow.authorization_url(
         access_type="offline",
         include_granted_scopes="true",
         prompt="consent",
+        state=state,
     )
-    _google_state = state
     return RedirectResponse(auth_url)
 
 
 @app.get("/auth/google/callback")
-def auth_google_callback(request: Request, code: str, state: Optional[str] = None):
-    global _google_creds_data
-    if _google_state and state and state != _google_state:
+def auth_google_callback(request: Request, code: str, state: str, db: OrmSession = Depends(get_db)):
+    record = db.query(GoogleOAuthState).filter(GoogleOAuthState.state == state).first()
+    if not record:
         raise HTTPException(status_code=400, detail="Invalid OAuth state.")
+    now = datetime.now(timezone.utc)
+    expires_at = record.expires_at
+    expired = False
+    if expires_at.tzinfo is None:
+        expired = expires_at <= datetime.utcnow()
+    else:
+        expired = expires_at <= now
+    if expired:
+        db.delete(record)
+        db.commit()
+        raise HTTPException(status_code=400, detail="OAuth state expired. Please try again.")
+    user_id = record.user_id
     flow = _google_flow()
     try:
         flow.fetch_token(authorization_response=str(request.url))
@@ -2457,14 +2524,36 @@ def auth_google_callback(request: Request, code: str, state: Optional[str] = Non
                    "Verify GOOGLE_CLIENT_ID/SECRET and GOOGLE_CLIENT_TYPE match the OAuth client in Google Cloud.",
         ) from exc
     creds = flow.credentials
-    _google_creds_data = {
-        "token": creds.token,
-        "refresh_token": creds.refresh_token,
-        "token_uri": creds.token_uri,
-        "client_id": creds.client_id,
-        "client_secret": creds.client_secret,
-        "scopes": creds.scopes,
-    }
+    existing = db.query(GoogleCredential).filter(GoogleCredential.user_id == user_id).first()
+    refresh_token = creds.refresh_token or (existing.refresh_token if existing else None)
+    scopes = json.dumps(creds.scopes or GOOGLE_SCOPES)
+    if existing:
+        existing.token = creds.token
+        existing.refresh_token = refresh_token
+        existing.token_uri = creds.token_uri
+        existing.client_id = creds.client_id
+        existing.client_secret = creds.client_secret
+        existing.scopes = scopes
+        existing.expiry = creds.expiry
+        db.add(existing)
+    else:
+        db.add(GoogleCredential(
+            user_id=user_id,
+            token=creds.token,
+            refresh_token=refresh_token,
+            token_uri=creds.token_uri,
+            client_id=creds.client_id,
+            client_secret=creds.client_secret,
+            scopes=scopes,
+            expiry=creds.expiry,
+        ))
+    db.delete(record)
+    try:
+        db.commit()
+    except SQLAlchemyError as exc:
+        db.rollback()
+        logger.exception("Failed to store Google credentials: user_id=%s", user_id)
+        raise HTTPException(status_code=500, detail="Could not save Google credentials.") from exc
     html = (
         "<!doctype html>"
         "<html><head><meta charset=\"utf-8\">"
@@ -2485,8 +2574,8 @@ def auth_google_callback(request: Request, code: str, state: Optional[str] = Non
 
 
 @app.get("/google/docs")
-def list_google_docs():
-    creds = _get_google_creds()
+def list_google_docs(user: User = Depends(get_current_user), db: OrmSession = Depends(get_db)):
+    creds = _get_google_creds(user, db)
     drive = build("drive", "v3", credentials=creds)
     try:
         resp = drive.files().list(
@@ -2505,8 +2594,12 @@ def list_google_docs():
 
 
 @app.post("/google/docs/optimize")
-def optimize_google_doc(payload: GoogleDocOptimizeRequest):
-    creds = _get_google_creds()
+def optimize_google_doc(
+    payload: GoogleDocOptimizeRequest,
+    user: User = Depends(get_current_user),
+    db: OrmSession = Depends(get_db),
+):
+    creds = _get_google_creds(user, db)
     docs = build("docs", "v1", credentials=creds)
 
     doc = docs.documents().get(documentId=payload.doc_id).execute()
@@ -2603,8 +2696,12 @@ def optimize_google_doc(payload: GoogleDocOptimizeRequest):
 
 
 @app.post("/google/coverletter")
-def coverletter_google_doc(payload: GoogleCoverLetterRequest):
-    creds = _get_google_creds()
+def coverletter_google_doc(
+    payload: GoogleCoverLetterRequest,
+    user: User = Depends(get_current_user),
+    db: OrmSession = Depends(get_db),
+):
+    creds = _get_google_creds(user, db)
     docs = build("docs", "v1", credentials=creds)
 
     resume_doc = docs.documents().get(documentId=payload.resume_doc_id).execute()
@@ -2627,8 +2724,12 @@ def coverletter_google_doc(payload: GoogleCoverLetterRequest):
 
 
 @app.post("/google/coverletter/preview")
-def coverletter_google_preview(payload: GoogleCoverLetterPreviewRequest):
-    creds = _get_google_creds()
+def coverletter_google_preview(
+    payload: GoogleCoverLetterPreviewRequest,
+    user: User = Depends(get_current_user),
+    db: OrmSession = Depends(get_db),
+):
+    creds = _get_google_creds(user, db)
     docs = build("docs", "v1", credentials=creds)
 
     resume_doc = docs.documents().get(documentId=payload.resume_doc_id).execute()
@@ -2638,8 +2739,12 @@ def coverletter_google_preview(payload: GoogleCoverLetterPreviewRequest):
 
 
 @app.post("/google/docs/text")
-def google_doc_text(payload: GoogleDocTextRequest):
-    creds = _get_google_creds()
+def google_doc_text(
+    payload: GoogleDocTextRequest,
+    user: User = Depends(get_current_user),
+    db: OrmSession = Depends(get_db),
+):
+    creds = _get_google_creds(user, db)
     docs = build("docs", "v1", credentials=creds)
     resume_doc = docs.documents().get(documentId=payload.doc_id).execute()
     resume_text = _extract_google_doc_text(resume_doc)

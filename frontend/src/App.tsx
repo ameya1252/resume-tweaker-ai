@@ -191,9 +191,9 @@ export default function App() {
   const [selectedDocId, setSelectedDocId] = useState(
     () => localStorage.getItem('gdocs_selected_doc_id') || '',
   )
-  const [coverDocId, setCoverDocId] = useState(
-    () => localStorage.getItem('gdocs_cover_doc_id') || '',
-  )
+  useEffect(() => {
+    localStorage.removeItem('gdocs_cover_doc_id')
+  }, [])
   const [gdocsConnected, setGdocsConnected] = useState(false)
   const [gdocsStatus, setGdocsStatus] = useState<string | null>(null)
   const [gdocsPreviewLoaded, setGdocsPreviewLoaded] = useState(false)
@@ -253,13 +253,6 @@ export default function App() {
     }
   }, [selectedDocId])
 
-  useEffect(() => {
-    if (coverDocId) {
-      localStorage.setItem('gdocs_cover_doc_id', coverDocId)
-    } else {
-      localStorage.removeItem('gdocs_cover_doc_id')
-    }
-  }, [coverDocId])
 
   useEffect(() => {
     const handlePop = () => setRoutePath(window.location.pathname)
@@ -457,7 +450,6 @@ export default function App() {
     localStorage.removeItem('user_first_name')
     localStorage.removeItem('user_last_name')
     localStorage.removeItem('gdocs_selected_doc_id')
-    localStorage.removeItem('gdocs_cover_doc_id')
     setSessionToken('')
     setUserEmail('')
     setUserFirstName('')
@@ -577,6 +569,9 @@ export default function App() {
     if (!selectedDocId) return ''
     return `https://docs.google.com/document/d/${selectedDocId}/edit`
   }, [selectedDocId])
+  const gdocsPreviewKey = useMemo(() => {
+    return selectedDocId ? `${selectedDocId}:${gdocsPreviewLoaded ? '1' : '0'}` : 'none'
+  }, [selectedDocId, gdocsPreviewLoaded])
 
 
   const estimatedPdfPages = useMemo(() => {
@@ -788,7 +783,17 @@ export default function App() {
   }, [pdfB64])
 
   function openGoogleAuth() {
-    window.open(`${BACKEND_URL}/auth/google`, '_blank', 'width=520,height=720')
+    if (!sessionToken) {
+      setError('Please log in to connect Google Docs.')
+      return
+    }
+    try {
+      const url = new URL(`${BACKEND_URL}/auth/google`)
+      url.searchParams.set('session_token', sessionToken)
+      window.open(url.toString(), '_blank', 'width=520,height=720')
+    } catch {
+      window.open(`${BACKEND_URL}/auth/google?session_token=${encodeURIComponent(sessionToken)}`, '_blank', 'width=520,height=720')
+    }
   }
 
   const loadGoogleDocs = useCallback(async (showError = true) => {
@@ -800,16 +805,12 @@ export default function App() {
       const files = Array.isArray(res.data?.files) ? res.data.files : []
       const firstId = files[0]?.id || ''
       const nextSelectedId = selectedDocId || firstId
-      const nextCoverId = coverDocId || nextSelectedId
       setGoogleDocs(files)
       setGdocsConnected(true)
       if (!selectedDocId && nextSelectedId) {
         setSelectedDocId(nextSelectedId)
       }
-      if (!coverDocId && nextCoverId) {
-        setCoverDocId(nextCoverId)
-      }
-      return { files, selectedId: nextSelectedId, coverId: nextCoverId }
+      return { files, selectedId: nextSelectedId }
     } catch (e: any) {
       if (showError) {
         const msg =
@@ -821,7 +822,7 @@ export default function App() {
       setGdocsConnected(false)
       return null
     }
-  }, [coverDocId, selectedDocId])
+  }, [selectedDocId])
 
   useEffect(() => {
     function handleMessage(event: MessageEvent) {
@@ -847,13 +848,6 @@ export default function App() {
     if (mode !== 'gdocs') return
     loadGoogleDocs()
   }, [mode, loadGoogleDocs])
-
-  useEffect(() => {
-    if (mode !== 'gdocs' || uiStep !== 'edit') return
-    if (selectedDocId && !coverDocId) {
-      setCoverDocId(selectedDocId)
-    }
-  }, [mode, uiStep, selectedDocId, coverDocId])
 
   useEffect(() => {
     if (mode !== 'gdocs' || uiStep !== 'edit' || !selectedDocId) return
@@ -1450,10 +1444,25 @@ export default function App() {
                 </div>
                 {selectedDocId && (
                   <a className="btn" href={gdocsOpenUrl} target="_blank" rel="noreferrer">
-                    Edit Google Doc
+                    Open Google Doc
                   </a>
                 )}
               </div>
+              {selectedDocId && (
+                <div className="gdocs-preview-hint">
+                  <span className="small subtle">Preview not showing? Open in Google Docs.</span>
+                  <button
+                    className="btn small"
+                    type="button"
+                    onClick={() => {
+                      setGdocsPreviewLoaded(false)
+                      setGdocsPreviewFailed(false)
+                    }}
+                  >
+                    Retry preview
+                  </button>
+                </div>
+              )}
               {!selectedDocId ? (
                 <div className="small subtle">Select a Google Doc to preview.</div>
               ) : gdocsPreviewFailed ? (
@@ -1467,6 +1476,7 @@ export default function App() {
                 <iframe
                   className="gdocs-preview-frame"
                   src={gdocsPreviewUrl}
+                  key={gdocsPreviewKey}
                   title="Google Doc preview"
                   onLoad={() => {
                     setGdocsPreviewLoaded(true)
