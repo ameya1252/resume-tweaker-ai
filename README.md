@@ -106,3 +106,22 @@ This is intended as a **personal tool**. Do not deploy publicly without adding:
 - Rate limiting
 - File size limits
 - Logging / redaction
+
+---
+
+## OnlyOffice Deployment
+For DOCX in-browser editing, run OnlyOffice Document Server and set these env vars:
+
+Backend (Railway):
+- `ONLYOFFICE_URL=https://<onlyoffice-domain>`
+- `ONLYOFFICE_JWT_SECRET=<shared-secret>`
+- `BACKEND_BASE_URL=https://<railway-backend-domain>`
+
+Frontend (Vercel):
+- `VITE_ONLYOFFICE_URL=https://<onlyoffice-domain>`
+
+Callback URL example:
+- `https://<railway-backend-domain>/docx/editor/callback/{draft_id}`
+
+Render (OnlyOffice):
+- Deploy `onlyoffice/documentserver` with `JWT_ENABLED=true` and `JWT_SECRET` matching backend.
