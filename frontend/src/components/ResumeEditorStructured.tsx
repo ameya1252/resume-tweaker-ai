@@ -7,6 +7,7 @@ type ResumeEditorStructuredProps = {
   draftProjects: DraftProject[]
   skillsText?: string
   onApply: (changes: DraftApplyRequest) => Promise<void>
+  showEmptyMeta?: boolean
 }
 
 function normalizeBulletLine(line: string) {
@@ -18,6 +19,7 @@ export default function ResumeEditorStructured({
   draftProjects,
   skillsText,
   onApply,
+  showEmptyMeta = false,
 }: ResumeEditorStructuredProps) {
   const [bulletBlocks, setBulletBlocks] = useState<Record<string, string>>({})
   const [projectBulletBlocks, setProjectBulletBlocks] = useState<Record<string, string>>({})
@@ -84,12 +86,12 @@ export default function ResumeEditorStructured({
   }, [skillsText])
 
   const visibleExperiences = useMemo(() => {
-    return draftExperiences.filter((exp) => exp.company && exp.bullets.length > 0)
-  }, [draftExperiences])
+    return draftExperiences.filter((exp) => exp.bullets.length > 0 && (showEmptyMeta || exp.company))
+  }, [draftExperiences, showEmptyMeta])
 
   const visibleProjects = useMemo(() => {
-    return draftProjects.filter((proj) => proj.name && proj.bullets.length > 0)
-  }, [draftProjects])
+    return draftProjects.filter((proj) => proj.bullets.length > 0 && (showEmptyMeta || proj.name))
+  }, [draftProjects, showEmptyMeta])
 
   async function handleApply() {
     setSaveError(null)
@@ -102,13 +104,15 @@ export default function ResumeEditorStructured({
     const projectDateChanges: DraftItem[] = []
 
     for (const exp of visibleExperiences) {
-      const nextTitle = (titleEdits[exp.id] ?? '').trim()
-      if (nextTitle !== exp.title) {
-        titleChanges.push({ id: exp.id, text: nextTitle })
-      }
-      const nextCompany = (companyEdits[exp.id] ?? '').trim()
-      if (nextCompany !== exp.company) {
-        companyChanges.push({ id: exp.id, text: nextCompany })
+      if (!showEmptyMeta) {
+        const nextTitle = (titleEdits[exp.id] ?? '').trim()
+        if (nextTitle !== exp.title) {
+          titleChanges.push({ id: exp.id, text: nextTitle })
+        }
+        const nextCompany = (companyEdits[exp.id] ?? '').trim()
+        if (nextCompany !== exp.company) {
+          companyChanges.push({ id: exp.id, text: nextCompany })
+        }
       }
       const block = bulletBlocks[exp.id] ?? ''
       const lines = block
@@ -146,13 +150,15 @@ export default function ResumeEditorStructured({
     }
 
     for (const proj of visibleProjects) {
-      const nextName = (projectTitleEdits[proj.id] ?? '').trim()
-      if (nextName !== proj.name) {
-        projectTitleChanges.push({ id: proj.id, text: nextName })
-      }
-      const nextDates = (projectDateEdits[proj.id] ?? '').trim()
-      if (nextDates !== proj.dates) {
-        projectDateChanges.push({ id: proj.id, text: nextDates })
+      if (!showEmptyMeta) {
+        const nextName = (projectTitleEdits[proj.id] ?? '').trim()
+        if (nextName !== proj.name) {
+          projectTitleChanges.push({ id: proj.id, text: nextName })
+        }
+        const nextDates = (projectDateEdits[proj.id] ?? '').trim()
+        if (nextDates !== proj.dates) {
+          projectDateChanges.push({ id: proj.id, text: nextDates })
+        }
       }
       const block = projectBulletBlocks[proj.id] ?? ''
       const lines = block
@@ -236,18 +242,22 @@ export default function ResumeEditorStructured({
 
       {visibleExperiences.map((exp) => (
         <div key={exp.id} className="exp-editor">
-          <input
-            className="input exp-editor-company"
-            value={companyEdits[exp.id] ?? ''}
-            placeholder="Company"
-            onChange={(e) => setCompanyEdits((prev) => ({ ...prev, [exp.id]: e.target.value }))}
-          />
-          <input
-            className="input exp-editor-title"
-            value={titleEdits[exp.id] ?? ''}
-            placeholder="Role"
-            onChange={(e) => setTitleEdits((prev) => ({ ...prev, [exp.id]: e.target.value }))}
-          />
+          {!showEmptyMeta && (
+            <>
+              <input
+                className="input exp-editor-company"
+                value={companyEdits[exp.id] ?? ''}
+                placeholder="Company"
+                onChange={(e) => setCompanyEdits((prev) => ({ ...prev, [exp.id]: e.target.value }))}
+              />
+              <input
+                className="input exp-editor-title"
+                value={titleEdits[exp.id] ?? ''}
+                placeholder="Role"
+                onChange={(e) => setTitleEdits((prev) => ({ ...prev, [exp.id]: e.target.value }))}
+              />
+            </>
+          )}
           <textarea
             className="ta draft-textarea"
             rows={Math.max(3, exp.bullets.length + 1)}
@@ -268,18 +278,22 @@ export default function ResumeEditorStructured({
 
       {visibleProjects.map((proj) => (
         <div key={proj.id} className="exp-editor">
-          <input
-            className="input exp-editor-title"
-            value={projectTitleEdits[proj.id] ?? ''}
-            placeholder="Project name"
-            onChange={(e) => setProjectTitleEdits((prev) => ({ ...prev, [proj.id]: e.target.value }))}
-          />
-          <input
-            className="input exp-editor-company"
-            value={projectDateEdits[proj.id] ?? ''}
-            placeholder="Project dates"
-            onChange={(e) => setProjectDateEdits((prev) => ({ ...prev, [proj.id]: e.target.value }))}
-          />
+          {!showEmptyMeta && (
+            <>
+              <input
+                className="input exp-editor-title"
+                value={projectTitleEdits[proj.id] ?? ''}
+                placeholder="Project name"
+                onChange={(e) => setProjectTitleEdits((prev) => ({ ...prev, [proj.id]: e.target.value }))}
+              />
+              <input
+                className="input exp-editor-company"
+                value={projectDateEdits[proj.id] ?? ''}
+                placeholder="Project dates"
+                onChange={(e) => setProjectDateEdits((prev) => ({ ...prev, [proj.id]: e.target.value }))}
+              />
+            </>
+          )}
           <textarea
             className="ta draft-textarea"
             rows={Math.max(3, proj.bullets.length + 1)}

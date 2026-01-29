@@ -1,5 +1,6 @@
 import contextvars
 import json
+import io
 import logging
 import os
 import re
@@ -7,14 +8,18 @@ import subprocess
 import tempfile
 import time
 import uuid
+import base64
+import hashlib
+import hmac
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple, Union
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 from openai import OpenAI
 from passlib.context import CryptContext
 from pydantic import BaseModel, Field
@@ -25,9 +30,10 @@ from google.auth.transport.requests import Request as GoogleRequest
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+from docx import Document
 
 from db import Base, SessionLocal, engine
-from models import DownloadedResume, GoogleCredential, GoogleOAuthState, Resume, WaitlistEntry
+from models import DocxDraft, DownloadedResume, GoogleCredential, GoogleOAuthState, Resume, WaitlistEntry
 from models import Session as SessionModel
 from models import User
 
@@ -43,6 +49,9 @@ GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "").strip()
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "").strip()
 GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI", "").strip()
 GOOGLE_CLIENT_TYPE = os.getenv("GOOGLE_CLIENT_TYPE", "web").strip().lower()
+ONLYOFFICE_URL = os.getenv("ONLYOFFICE_URL", "").strip()
+ONLYOFFICE_JWT_SECRET = os.getenv("ONLYOFFICE_JWT_SECRET", "").strip()
+BACKEND_BASE_URL = os.getenv("BACKEND_BASE_URL", "").strip()
 
 if os.getenv("OAUTHLIB_INSECURE_TRANSPORT") is None and GOOGLE_REDIRECT_URI.startswith("http://localhost"):
     os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
@@ -143,6 +152,12 @@ _allowed_origins = [
 frontend_origin = os.getenv("FRONTEND_ORIGIN", "").strip()
 if frontend_origin:
     _allowed_origins.append(frontend_origin)
+if "http://localhost:8082" not in _allowed_origins:
+    _allowed_origins.append("http://localhost:8082")
+if ONLYOFFICE_URL:
+    parsed_onlyoffice = urlparse(ONLYOFFICE_URL)
+    if parsed_onlyoffice.scheme and parsed_onlyoffice.netloc:
+        _allowed_origins.append(f"{parsed_onlyoffice.scheme}://{parsed_onlyoffice.netloc}")
 
 EXPERIENCE_SECTION_NAMES = [
     "Experience",
@@ -180,6 +195,33 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def _origin_from_url(url: str) -> str:
+    if not url:
+        return ""
+    parsed = urlparse(url)
+    if not parsed.scheme or not parsed.netloc:
+        return ""
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+# @app.middleware("http")
+# async def add_frame_headers(request: Request, call_next):
+#     response = await call_next(request)
+#     onlyoffice_origin = _origin_from_url(ONLYOFFICE_URL)
+#     frontend_allowed = _origin_from_url(frontend_origin)
+#     frame_ancestors = ["'self'"]
+#     if onlyoffice_origin:
+#         frame_ancestors.append(onlyoffice_origin)
+#     if frontend_allowed and frontend_allowed not in frame_ancestors:
+#         frame_ancestors.append(frontend_allowed)
+#     response.headers.setdefault("Content-Security-Policy", f"frame-ancestors {' '.join(frame_ancestors)}")
+#     if onlyoffice_origin:
+#         response.headers.setdefault("X-Frame-Options", f"ALLOW-FROM {onlyoffice_origin}")
+#     else:
+#         response.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
+#     return response
 
 
 
@@ -265,6 +307,22 @@ class GoogleDocTextRequest(BaseModel):
 
 class WaitlistRequest(BaseModel):
     email: str
+
+
+class DocxDraftRef(BaseModel):
+    draft_id: str
+
+
+class DocxCoverLetterRequest(DocxDraftRef):
+    job_description: str
+
+
+class DocxOutreachRequest(DocxDraftRef):
+    job_description: str
+
+
+class DocxDownloadRequest(DocxDraftRef):
+    filename: Optional[str] = None
 
 
 class OutreachPreviewRequest(BaseModel):
@@ -443,6 +501,8 @@ def _google_doc_section_type(text: str) -> Optional[str]:
 
 
 def _looks_like_section_heading(text: str) -> bool:
+    if _detect_docx_section_type(text) is not None:
+        return True
     stripped = text.strip()
     if not stripped:
         return False
@@ -465,6 +525,204 @@ def _looks_like_section_heading(text: str) -> bool:
         "skills",
     }
     return stripped.lower() in common
+
+
+def _normalize_heading(text: str) -> str:
+    normalized = (text or "").lower().strip()
+    normalized = re.sub(r"[:;—–\-|&]", " ", normalized)
+    normalized = re.sub(r"[^a-z0-9\s]", "", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return normalized
+
+
+def _detect_docx_section_type(text: str) -> Optional[str]:
+    normalized = _normalize_heading(text)
+    if not normalized or len(normalized) > 40:
+        return None
+    experience_aliases = {
+        "experience",
+        "work experience",
+        "professional experience",
+        "employment",
+        "work history",
+        "professional history",
+        "industry experience",
+    }
+    projects_aliases = {
+        "projects",
+        "personal projects",
+        "academic projects",
+        "relevant projects",
+        "project experience",
+        "selected projects",
+    }
+    skills_aliases = {
+        "skills",
+        "technical skills",
+        "core skills",
+        "tools",
+        "technologies",
+        "tech stack",
+        "competencies",
+        "skills tools",
+        "skills and tools",
+    }
+    if normalized in experience_aliases or normalized.endswith("experience"):
+        return "experience"
+    if normalized in projects_aliases or normalized.endswith("projects"):
+        return "projects"
+    if normalized in skills_aliases or normalized.endswith("skills"):
+        return "skills"
+    return None
+
+
+def _base64url_encode(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def _base64url_decode(raw: str) -> bytes:
+    padded = raw + "=" * (-len(raw) % 4)
+    return base64.urlsafe_b64decode(padded.encode("ascii"))
+
+
+def _onlyoffice_sign(payload: Dict[str, object]) -> str:
+    if not ONLYOFFICE_JWT_SECRET:
+        return ""
+    header = {"alg": "HS256", "typ": "JWT"}
+    header_b64 = _base64url_encode(json.dumps(header, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
+    payload_b64 = _base64url_encode(json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
+    signing_input = f"{header_b64}.{payload_b64}".encode("ascii")
+    signature = hmac.new(ONLYOFFICE_JWT_SECRET.encode("utf-8"), signing_input, hashlib.sha256).digest()
+    signature_b64 = _base64url_encode(signature)
+    return f"{header_b64}.{payload_b64}.{signature_b64}"
+
+
+def _onlyoffice_verify(token: str) -> Optional[Dict[str, object]]:
+    if not ONLYOFFICE_JWT_SECRET or not token:
+        return None
+    parts = token.split(".")
+    if len(parts) != 3:
+        return None
+    header_b64, payload_b64, sig_b64 = parts
+    signing_input = f"{header_b64}.{payload_b64}".encode("ascii")
+    expected = hmac.new(ONLYOFFICE_JWT_SECRET.encode("utf-8"), signing_input, hashlib.sha256).digest()
+    try:
+        received = _base64url_decode(sig_b64)
+    except Exception:
+        return None
+    if not hmac.compare_digest(expected, received):
+        return None
+    try:
+        payload_raw = _base64url_decode(payload_b64)
+        decoded = json.loads(payload_raw.decode("utf-8"))
+    except Exception:
+        return None
+    if isinstance(decoded, dict):
+        return decoded
+    return None
+
+
+def _is_docx_heading(paragraph) -> bool:
+    style_name = getattr(paragraph.style, "name", "") or ""
+    if style_name.lower().startswith("heading"):
+        return True
+    return _looks_like_section_heading(paragraph.text or "")
+
+
+def _is_docx_bullet(paragraph) -> bool:
+    try:
+        num_pr = paragraph._p.pPr.numPr  # type: ignore[attr-defined]
+        if num_pr is not None:
+            return True
+    except Exception:
+        pass
+    style_name = getattr(paragraph.style, "name", "") or ""
+    return "list" in style_name.lower()
+
+
+def _set_docx_paragraph_text(paragraph, text: str) -> None:
+    for run in paragraph.runs:
+        run.text = ""
+    paragraph.add_run(text)
+
+
+def _extract_docx_text(doc: Document) -> str:
+    lines = []
+    for para in doc.paragraphs:
+        txt = (para.text or "").strip()
+        if txt:
+            lines.append(txt)
+    return "\n".join(lines)
+
+
+def _extract_docx_slots(doc: Document) -> Tuple[List[Dict[str, str]], List[int], List[int]]:
+    slots: List[Dict[str, str]] = []
+    bullet_indices: List[int] = []
+    skills_indices: List[int] = []
+    current_section: Optional[str] = None
+    slot_idx = 0
+
+    for idx, para in enumerate(doc.paragraphs):
+        raw = para.text or ""
+        text = raw.strip()
+        if not text:
+            continue
+        if _is_docx_heading(para):
+            current_section = _detect_docx_section_type(text)
+            continue
+        if current_section in ("experience", "projects") and _is_docx_bullet(para):
+            slot_idx += 1
+            slots.append(
+                {
+                    "id": f"docx_bullet_{slot_idx}",
+                    "text": text,
+                    "max_chars": 130,
+                    "section_type": current_section,
+                }
+            )
+            bullet_indices.append(idx)
+        elif current_section == "skills" and _is_docx_bullet(para):
+            skills_indices.append(idx)
+
+    return slots, bullet_indices, skills_indices
+
+
+def _docx_preview_from_indices(
+    doc: Document,
+    bullet_map: List[Dict[str, Union[str, int]]],
+    skills_indices: List[int],
+) -> Dict[str, object]:
+    bullets: List[Dict[str, str]] = []
+    project_bullets: List[Dict[str, str]] = []
+    for item in bullet_map:
+        para_idx = int(item["paragraph_index"])
+        text = doc.paragraphs[para_idx].text.strip()
+        entry = {"id": str(item["id"]), "text": text}
+        if item.get("section_type") == "projects":
+            project_bullets.append(entry)
+        else:
+            bullets.append(entry)
+    skills_lines = [doc.paragraphs[i].text.strip() for i in skills_indices if doc.paragraphs[i].text.strip()]
+    return {
+        "bullets": bullets,
+        "project_bullets": project_bullets,
+        "skills": "\n".join(skills_lines),
+    }
+
+
+def _get_docx_draft(
+    draft_id: str,
+    user: User,
+    db: OrmSession,
+) -> DocxDraft:
+    draft = (
+        db.query(DocxDraft)
+        .filter(DocxDraft.id == draft_id, DocxDraft.user_id == user.id)
+        .first()
+    )
+    if not draft:
+        raise HTTPException(status_code=404, detail="DOCX draft not found.")
+    return draft
 
 
 def _extract_google_doc_slots(doc: dict, keyword_hint: List[str]) -> Tuple[List[Slot], List[Tuple[int, int]]]:
@@ -2753,6 +3011,330 @@ def google_doc_text(
     resume_doc = docs.documents().get(documentId=payload.doc_id).execute()
     resume_text = _extract_google_doc_text(resume_doc)
     return {"text": resume_text}
+
+
+@app.post("/docx/optimize")
+def optimize_docx_resume(
+    resume_file: UploadFile = File(...),
+    job_description: str = Form(...),
+    risk_level: str = Form("balanced"),
+    user: User = Depends(get_current_user),
+    db: OrmSession = Depends(get_db),
+):
+    if not resume_file.filename or not resume_file.filename.lower().endswith(".docx"):
+        raise HTTPException(status_code=400, detail="Only .docx files are supported.")
+    if resume_file.content_type and resume_file.content_type not in (
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "application/octet-stream",
+    ):
+        raise HTTPException(status_code=400, detail="Invalid file type.")
+
+    logger.info("DOCX optimize upload: filename=%s", resume_file.filename)
+    try:
+        contents = resume_file.file.read()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Could not read uploaded file.") from exc
+    if not contents:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as tmp_in:
+        tmp_in.write(contents)
+        input_path = tmp_in.name
+
+    doc = Document(input_path)
+    try:
+        os.unlink(input_path)
+    except Exception:
+        pass
+    slots, bullet_indices, skills_indices = _extract_docx_slots(doc)
+    if not slots:
+        raise HTTPException(status_code=400, detail="No bullet paragraphs found in this DOCX.")
+
+    bullets_for_ai: List[Dict[str, str]] = []
+    for slot in slots:
+        bullets_for_ai.append(
+            {
+                "id": slot["id"],
+                "text": slot["text"],
+                "context": "",
+                "max_chars": slot["max_chars"],
+            }
+        )
+
+    rewritten_bullets: Dict[str, str] = {}
+    if bullets_for_ai:
+        rewritten_bullets = _call_openai_rewrite_bullets_only(job_description, bullets_for_ai, risk_level)
+        if len(rewritten_bullets) != len(bullets_for_ai):
+            raise HTTPException(status_code=500, detail="AI returned unexpected bullet count.")
+
+    for idx, para_idx in enumerate(bullet_indices):
+        slot = slots[idx]
+        new_text = rewritten_bullets.get(slot["id"], slot["text"])
+        if len(new_text) > int(slot["max_chars"]):
+            raise HTTPException(status_code=500, detail="AI produced a bullet that exceeds max characters.")
+        _set_docx_paragraph_text(doc.paragraphs[para_idx], new_text)
+
+    if skills_indices:
+        skills_text = "\n".join([doc.paragraphs[i].text.strip() for i in skills_indices if doc.paragraphs[i].text.strip()])
+        if skills_text.strip():
+            rewritten_skills = _call_openai_rewrite_skills_plain(
+                job_description,
+                skills_text,
+                max_chars=1000,
+                target_lines=len(skills_indices),
+            )
+            lines = [line.strip() for line in rewritten_skills.splitlines() if line.strip()]
+            if len(lines) != len(skills_indices):
+                raise HTTPException(status_code=500, detail="AI returned unexpected skills line count.")
+            for para_idx, line in zip(skills_indices, lines):
+                _set_docx_paragraph_text(doc.paragraphs[para_idx], line)
+
+    bullet_map = []
+    for slot, para_idx in zip(slots, bullet_indices):
+        bullet_map.append(
+            {
+                "id": slot["id"],
+                "paragraph_index": para_idx,
+                "max_chars": slot["max_chars"],
+                "section_type": slot["section_type"],
+            }
+        )
+    draft_doc = tempfile.NamedTemporaryFile(delete=False, suffix=".docx")
+    doc.save(draft_doc.name)
+    with open(draft_doc.name, "rb") as handle:
+        docx_bytes = handle.read()
+    try:
+        os.unlink(draft_doc.name)
+    except Exception:
+        pass
+
+    draft = DocxDraft(
+        user_id=user.id,
+        docx_bytes=docx_bytes,
+        bullet_map=json.dumps(bullet_map),
+        skills_map=json.dumps(skills_indices),
+    )
+    db.add(draft)
+    try:
+        db.commit()
+    except SQLAlchemyError as exc:
+        db.rollback()
+        logger.exception("Failed to save DOCX draft: user_id=%s", user.id)
+        raise HTTPException(status_code=500, detail="Could not save DOCX draft.") from exc
+
+    preview = _docx_preview_from_indices(doc, bullet_map, skills_indices)
+    return {
+        "draft_id": draft.id,
+        "draft": preview,
+        "pdf_available": False,
+        "docx_available": True,
+    }
+
+
+@app.post("/docx/draft/apply")
+def apply_docx_draft(
+    payload: DraftApplyRequest,
+    draft_id: str = Query(...),
+    user: User = Depends(get_current_user),
+    db: OrmSession = Depends(get_db),
+):
+    draft = _get_docx_draft(draft_id, user, db)
+    bullet_map = json.loads(draft.bullet_map)
+    skills_indices = json.loads(draft.skills_map)
+    doc = Document(io.BytesIO(draft.docx_bytes))
+
+    changes: Dict[str, str] = {}
+    if payload.bullets:
+        for item in payload.bullets:
+            if item.id and item.text:
+                changes[item.id] = item.text.strip()
+    if payload.project_bullets:
+        for item in payload.project_bullets:
+            if item.id and item.text:
+                changes[item.id] = item.text.strip()
+
+    for item in bullet_map:
+        bid = str(item["id"])
+        if bid not in changes:
+            continue
+        new_text = changes[bid]
+        max_chars = int(item.get("max_chars", 130))
+        if len(new_text) > max_chars:
+            raise HTTPException(status_code=400, detail="Bullet exceeds max characters.")
+        _set_docx_paragraph_text(doc.paragraphs[int(item["paragraph_index"])], new_text)
+
+    if payload.skills is not None:
+        lines = [line.strip() for line in payload.skills.replace("\r", "").splitlines() if line.strip()]
+        if len(lines) != len(skills_indices):
+            raise HTTPException(status_code=400, detail="Skills line count must remain the same.")
+        for para_idx, line in zip(skills_indices, lines):
+            _set_docx_paragraph_text(doc.paragraphs[int(para_idx)], line)
+
+    out = io.BytesIO()
+    doc.save(out)
+    draft.docx_bytes = out.getvalue()
+    db.add(draft)
+    try:
+        db.commit()
+    except SQLAlchemyError as exc:
+        db.rollback()
+        logger.exception("Failed to update DOCX draft: user_id=%s draft_id=%s", user.id, draft_id)
+        raise HTTPException(status_code=500, detail="Could not update DOCX draft.") from exc
+
+    preview = _docx_preview_from_indices(doc, bullet_map, skills_indices)
+    return {
+        "draft": preview,
+        "pdf_available": False,
+        "docx_available": True,
+    }
+
+
+@app.post("/docx/download")
+def download_docx_draft(
+    payload: DocxDownloadRequest,
+    background_tasks: BackgroundTasks,
+    user: User = Depends(get_current_user),
+    db: OrmSession = Depends(get_db),
+):
+    draft = _get_docx_draft(payload.draft_id, user, db)
+    filename = payload.filename or "optimized_resume.docx"
+    if not filename.lower().endswith(".docx"):
+        filename = f"{filename}.docx"
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as tmp_out:
+        tmp_out.write(draft.docx_bytes)
+        output_path = tmp_out.name
+    background_tasks.add_task(os.unlink, output_path)
+    return FileResponse(
+        output_path,
+        filename=filename,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    )
+
+
+@app.get("/docx/editor/{draft_id}")
+def docx_editor_config(
+    draft_id: str,
+    request: Request,
+    db: OrmSession = Depends(get_db),
+):
+    draft = db.query(DocxDraft).filter(DocxDraft.id == draft_id).first()
+    if not draft:
+        raise HTTPException(status_code=404, detail="DOCX draft not found.")
+    backend_base = (BACKEND_BASE_URL or "http://host.docker.internal:8000").rstrip("/")
+    file_url = f"{backend_base}/docx/editor/file/{draft_id}"
+    callback_url = f"{backend_base}/docx/editor/callback/{draft_id}"
+    config: Dict[str, object] = {
+        "documentType": "word",
+        "document": {
+            "fileType": "docx",
+            "key": draft_id,
+            "title": "resume.docx",
+            "url": file_url,
+        },
+        "editorConfig": {
+            "callbackUrl": callback_url,
+            "mode": "edit",
+        },
+    }
+    logger.info("OnlyOffice editor config: %s", json.dumps(config))
+    logger.info("OnlyOffice URLs: file_url=%s callback_url=%s", file_url, callback_url)
+    return config
+
+
+@app.get("/docx/editor/file/{draft_id}", name="docx_editor_file")
+def docx_editor_file(
+    draft_id: str,
+    db: OrmSession = Depends(get_db),
+):
+    draft = db.query(DocxDraft).filter(DocxDraft.id == draft_id).first()
+    if not draft:
+        logger.info("OnlyOffice file fetch: draft_id=%s status=404", draft_id)
+        raise HTTPException(status_code=404, detail="DOCX draft not found.")
+    response = Response(
+        content=draft.docx_bytes,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={
+            "Content-Disposition": "inline; filename=resume.docx",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+            "Access-Control-Allow-Headers": "*",
+        },
+    )
+    logger.info("OnlyOffice file fetch: draft_id=%s status=200 bytes=%s", draft_id, len(draft.docx_bytes))
+    return response
+
+
+@app.post("/docx/editor/callback/{draft_id}", name="docx_editor_callback")
+async def docx_editor_callback(
+    draft_id: str,
+    request: Request,
+    db: OrmSession = Depends(get_db),
+):
+    payload = await request.json()
+    status = payload.get("status") if isinstance(payload, dict) else None
+    if status not in {2, 6}:
+        return JSONResponse({"error": 0})
+
+    file_url = payload.get("url") if isinstance(payload, dict) else None
+    if not file_url:
+        return JSONResponse({"error": 1})
+
+    logger.info("OnlyOffice callback save event: draft_id=%s status=%s", draft_id, status)
+    try:
+        with urllib.request.urlopen(file_url, timeout=20) as resp:
+            updated_bytes = resp.read()
+    except Exception:
+        return JSONResponse({"error": 1})
+    if not updated_bytes:
+        return JSONResponse({"error": 1})
+
+    draft = db.query(DocxDraft).filter(DocxDraft.id == draft_id).first()
+    if not draft:
+        return JSONResponse({"error": 1})
+    draft.docx_bytes = updated_bytes
+    try:
+        db.add(draft)
+        db.commit()
+    except SQLAlchemyError:
+        db.rollback()
+        return JSONResponse({"error": 1})
+    logger.info("OnlyOffice draft saved: draft_id=%s bytes=%s", draft_id, len(updated_bytes))
+    return JSONResponse({"error": 0})
+
+
+@app.get("/docx/editor/health")
+def docx_editor_health():
+    return {
+        "onlyoffice_url": ONLYOFFICE_URL,
+        "jwt_enabled": bool(ONLYOFFICE_JWT_SECRET),
+        "status": "ok",
+    }
+
+
+@app.post("/docx/coverletter")
+def coverletter_docx(
+    payload: DocxCoverLetterRequest,
+    user: User = Depends(get_current_user),
+    db: OrmSession = Depends(get_db),
+):
+    draft = _get_docx_draft(payload.draft_id, user, db)
+    doc = Document(io.BytesIO(draft.docx_bytes))
+    resume_text = _extract_docx_text(doc)
+    cover_letter = _call_openai_cover_letter(payload.job_description, resume_text)
+    return {"cover_letter": cover_letter}
+
+
+@app.post("/docx/outreach/preview")
+def outreach_docx_preview(
+    payload: DocxOutreachRequest,
+    user: User = Depends(get_current_user),
+    db: OrmSession = Depends(get_db),
+):
+    draft = _get_docx_draft(payload.draft_id, user, db)
+    doc = Document(io.BytesIO(draft.docx_bytes))
+    resume_text = _extract_docx_text(doc)
+    preview = _call_openai_outreach_preview(payload.job_description, resume_text)
+    return preview
 
 
 @app.post("/waitlist")

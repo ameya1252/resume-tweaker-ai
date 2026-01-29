@@ -6,6 +6,7 @@ import { estimateVisualLines } from './utils/formatting'
 import { buildDraftExperiences, buildDraftProjects, Draft, DraftApplyRequest, DraftExperience, DraftProject } from './utils/draft'
 
 const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || 'http://localhost:8000'
+const ONLYOFFICE_URL = import.meta.env.VITE_ONLYOFFICE_URL || ''
 
 type GoogleDoc = { id: string; name: string }
 type DownloadedResume = { id: string; name: string; created_at: string }
@@ -165,6 +166,14 @@ function makeUniqueName(baseName: string, existingNames: string[]) {
   return candidate
 }
 
+function buildOnlyOfficeUrl(configUrl: string) {
+  if (!ONLYOFFICE_URL) return ''
+  const trimmed = ONLYOFFICE_URL.replace(/\/+$/, '')
+  const base = `${trimmed}/web-apps/apps/documenteditor/main/index.html`
+  const encoded = encodeURIComponent(configUrl)
+  return `${base}?configUrl=${encoded}`
+}
+
 export default function App() {
   const [sessionToken, setSessionToken] = useState(() => localStorage.getItem('session_token') || '')
   const [userEmail, setUserEmail] = useState(() => localStorage.getItem('user_email') || '')
@@ -190,11 +199,12 @@ export default function App() {
   const [latexFile, setLatexFile] = useState<File | null>(null)
   const [latexText, setLatexText] = useState('')
   const [hasTemplate, setHasTemplate] = useState(false)
-  const [mode, setMode] = useState<'latex' | 'gdocs'>('latex')
+  const [mode, setMode] = useState<'latex' | 'gdocs' | 'docx'>('latex')
   const [googleDocs, setGoogleDocs] = useState<GoogleDoc[]>([])
   const [selectedDocId, setSelectedDocId] = useState(
     () => localStorage.getItem('gdocs_selected_doc_id') || '',
   )
+  const [docxFile, setDocxFile] = useState<File | null>(null)
   useEffect(() => {
     localStorage.removeItem('gdocs_cover_doc_id')
   }, [])
@@ -216,6 +226,13 @@ export default function App() {
   const [keywordHints, setKeywordHints] = useState<string[]>([])
   const [coverLetterText, setCoverLetterText] = useState<string>('')
   const [pdfUrl, setPdfUrl] = useState<string>('')
+  const [docxDraftId, setDocxDraftId] = useState<string | null>(null)
+  const [docxAvailable, setDocxAvailable] = useState(false)
+  const [onlyOfficeUrl, setOnlyOfficeUrl] = useState('')
+  const [onlyOfficeLoading, setOnlyOfficeLoading] = useState(false)
+  const [onlyOfficeError, setOnlyOfficeError] = useState<string | null>(null)
+  const [onlyOfficeLoaded, setOnlyOfficeLoaded] = useState(false)
+  const [onlyOfficeLastError, setOnlyOfficeLastError] = useState<string | null>(null)
   const [outreachPreview, setOutreachPreview] = useState<{
     target_roles: string[]
     linkedin_searches: Array<{ label: string; url: string }>
@@ -230,6 +247,8 @@ export default function App() {
   const previewRef = useRef<HTMLDivElement | null>(null)
   const gdocsPreviewTimerRef = useRef<number | null>(null)
   const outreachKeyRef = useRef<string>('')
+  const onlyOfficeFrameRef = useRef<HTMLIFrameElement | null>(null)
+  const onlyOfficeTimerRef = useRef<number | null>(null)
   const backendOrigin = useMemo(() => {
     try {
       return new URL(BACKEND_URL).origin
@@ -256,6 +275,51 @@ export default function App() {
       localStorage.removeItem('gdocs_selected_doc_id')
     }
   }, [selectedDocId])
+
+  useEffect(() => {
+    if (mode !== 'docx' || !docxDraftId || (uiStep !== 'edit' && uiStep !== 'export')) {
+      setOnlyOfficeUrl('')
+      setOnlyOfficeError(null)
+      setOnlyOfficeLoading(false)
+      setOnlyOfficeLoaded(false)
+      return
+    }
+    if (!ONLYOFFICE_URL) {
+      setOnlyOfficeError('OnlyOffice URL is not configured.')
+      setOnlyOfficeUrl('')
+      setOnlyOfficeLoading(false)
+      setOnlyOfficeLoaded(false)
+      return
+    }
+    const configEndpoint = `${BACKEND_URL}/docx/editor/${encodeURIComponent(docxDraftId)}`
+    const url = buildOnlyOfficeUrl(configEndpoint)
+    setOnlyOfficeUrl(url)
+    setOnlyOfficeLoading(true)
+    setOnlyOfficeLoaded(false)
+    setOnlyOfficeError(null)
+    setOnlyOfficeLastError(null)
+    console.log('OnlyOffice draftId:', docxDraftId)
+    console.log('OnlyOffice configUrl:', configEndpoint)
+    console.log('OnlyOffice iframe src:', url)
+    if (onlyOfficeTimerRef.current) {
+      window.clearTimeout(onlyOfficeTimerRef.current)
+    }
+    onlyOfficeTimerRef.current = window.setTimeout(() => {
+      setOnlyOfficeLoading(false)
+      setOnlyOfficeError('OnlyOffice editor is taking too long to load.')
+      console.error('OnlyOffice iframe timeout. Last error:', onlyOfficeLastError)
+    }, 5000)
+    return () => {
+      if (onlyOfficeTimerRef.current) {
+        window.clearTimeout(onlyOfficeTimerRef.current)
+      }
+    }
+  }, [mode, docxDraftId, uiStep, onlyOfficeLastError])
+
+  const handleOnlyOfficeSave = useCallback(() => {
+    if (!onlyOfficeFrameRef.current?.contentWindow) return
+    onlyOfficeFrameRef.current.contentWindow.postMessage({ command: 'save' }, '*')
+  }, [])
 
 
   useEffect(() => {
@@ -494,7 +558,7 @@ export default function App() {
     setHasTemplate(false)
     setMode('latex')
     setSelectedDocId('')
-    setCoverDocId('')
+    setDocxFile(null)
     setGdocsStatus(null)
     setCoverLetterStatus(null)
     setLoading(false)
@@ -504,10 +568,13 @@ export default function App() {
     setTexB64(null)
     setPdfB64(null)
     setPdfAvailable(false)
+    setDocxAvailable(false)
     setBulletsEdited(null)
     setKeywordHints([])
     setCoverLetterText('')
     setPdfUrl('')
+    setDocxDraftId(null)
+    setDocxAvailable(false)
     setOutreachPreview(null)
     setOutreachLoading(false)
     setOutreachError(null)
@@ -521,15 +588,21 @@ export default function App() {
     if (mode === 'gdocs') {
       return jobDescription.trim().length > 40 && !!selectedDocId
     }
+    if (mode === 'docx') {
+      return jobDescription.trim().length > 40 && !!docxFile
+    }
     return jobDescription.trim().length > 40 && hasTemplate
-  }, [jobDescription, mode, selectedDocId, hasTemplate])
+  }, [jobDescription, mode, selectedDocId, hasTemplate, docxFile])
 
   const canGenerateCover = useMemo(() => {
     if (mode === 'gdocs') {
       return jobDescription.trim().length > 40 && !!selectedDocId
     }
+    if (mode === 'docx') {
+      return jobDescription.trim().length > 40 && !!docxDraftId
+    }
     return jobDescription.trim().length > 40 && hasTemplate
-  }, [jobDescription, mode, selectedDocId, hasTemplate])
+  }, [jobDescription, mode, selectedDocId, hasTemplate, docxDraftId])
 
   const longBulletCount = useMemo(() => {
     if (!draft) return 0
@@ -633,10 +706,15 @@ export default function App() {
     if (mode === 'latex' && !draft) return
     let active = true
     const run = async () => {
+      if (active) {
+        setOutreachLoading(true)
+        setOutreachError(null)
+      }
       let outreachResumeText = resumeText
       if (mode === 'gdocs') {
         if (!selectedDocId) {
           setOutreachError('Select a Google Doc to generate outreach.')
+          if (active) setOutreachLoading(false)
           return
         }
         try {
@@ -651,18 +729,48 @@ export default function App() {
             'Could not read Google Doc text.'
           if (active) {
             setOutreachError(String(msg))
+            setOutreachLoading(false)
+          }
+          return
+        }
+      } else if (mode === 'docx') {
+        if (!docxDraftId) {
+          setOutreachError('Optimize your DOCX resume before outreach.')
+          if (active) setOutreachLoading(false)
+          return
+        }
+        try {
+          const res = await axios.post(`${BACKEND_URL}/docx/outreach/preview`, {
+            draft_id: docxDraftId,
+            job_description: jobDescription,
+          })
+          if (active) {
+            setOutreachPreview(res.data)
+            setOutreachLoading(false)
+          }
+          return
+        } catch (e: any) {
+          const msg =
+            e?.response?.data?.detail ||
+            e?.message ||
+            'Could not generate outreach preview.'
+          if (active) {
+            setOutreachError(String(msg))
+            setOutreachLoading(false)
           }
           return
         }
       }
-      if (!outreachResumeText.trim()) return
-      const key = `${jobDescription.trim()}::${outreachResumeText.trim()}`
-      if (outreachKeyRef.current === key && outreachPreview) return
-      outreachKeyRef.current = key
-      if (active) {
-        setOutreachLoading(true)
-        setOutreachError(null)
+      if (!outreachResumeText.trim()) {
+        if (active) setOutreachLoading(false)
+        return
       }
+      const key = `${jobDescription.trim()}::${outreachResumeText.trim()}`
+      if (outreachKeyRef.current === key && outreachPreview) {
+        if (active) setOutreachLoading(false)
+        return
+      }
+      outreachKeyRef.current = key
       try {
         const res = await axios.post(`${BACKEND_URL}/outreach/preview`, {
           job_description: jobDescription,
@@ -689,7 +797,7 @@ export default function App() {
     return () => {
       active = false
     }
-  }, [uiStep, mode, draft, jobDescription, resumeText, selectedDocId, outreachPreview])
+  }, [uiStep, mode, draft, jobDescription, resumeText, selectedDocId, outreachPreview, docxDraftId])
 
 
   async function handleApplyDraft(
@@ -698,6 +806,23 @@ export default function App() {
   ) {
     setError(null)
     try {
+      if (mode === 'docx') {
+        if (!docxDraftId) {
+          throw new Error('No DOCX draft available.')
+        }
+        const res = await axios.post(
+          `${BACKEND_URL}/docx/draft/apply?draft_id=${encodeURIComponent(docxDraftId)}`,
+          changes,
+        )
+        const draftPayload = res.data?.draft
+        if (draftPayload) {
+          setDraft(draftPayload)
+          setDocxAvailable(!!res.data?.docx_available)
+          setPdfAvailable(!!res.data?.pdf_available)
+          setUiStep('edit')
+        }
+        return
+      }
       const res = await axios.post(`${BACKEND_URL}/draft/apply`, changes)
       const { pdf_base64, pdf_available } = res.data || {}
       if (pdf_base64) {
@@ -761,10 +886,12 @@ export default function App() {
     setTexB64(null)
     setPdfB64(null)
     setPdfAvailable(false)
+    setDocxAvailable(false)
     setBulletsEdited(null)
     setKeywordHints([])
     setDraft(null)
     setUpdatedTitles([])
+    setDocxDraftId(null)
     setScoreBefore(null)
     setScoreAfter(null)
     setUiStep('input')
@@ -775,13 +902,16 @@ export default function App() {
     setCoverLetterStatus(null)
   }
 
-  function handleModeChange(nextMode: 'latex' | 'gdocs') {
+  function handleModeChange(nextMode: 'latex' | 'gdocs' | 'docx') {
     setMode(nextMode)
     setError(null)
     setGdocsStatus(null)
     resetOutputs()
     resetCoverLetter()
     setUiStep('input')
+    if (nextMode !== 'docx') {
+      setDocxFile(null)
+    }
   }
 
   useEffect(() => {
@@ -908,6 +1038,31 @@ export default function App() {
     resetOutputs()
     let nextStep: 'input' | 'edit' | 'export' | null = null
     try {
+      if (mode === 'docx') {
+        if (!docxFile) {
+          setError('Please upload a .docx resume.')
+          return
+        }
+        const form = new FormData()
+        form.append('resume_file', docxFile)
+        form.append('job_description', jobDescription)
+        form.append('risk_level', 'balanced')
+        const res = await axios.post(`${BACKEND_URL}/docx/optimize`, form, {
+          headers: { 'Content-Type': 'multipart/form-data' },
+        })
+        const draftPayload = res.data?.draft
+        if (!draftPayload) {
+          throw new Error('No DOCX draft returned.')
+        }
+        setDraft(draftPayload)
+        setDocxDraftId(res.data?.draft_id || null)
+        setDocxAvailable(!!res.data?.docx_available)
+        setPdfAvailable(!!res.data?.pdf_available)
+        setScoreBefore(60 + Math.floor(Math.random() * 11))
+        setScoreAfter(85 + Math.floor(Math.random() * 11))
+        nextStep = 'edit'
+        return
+      }
       if (mode === 'gdocs') {
         const refreshed = await loadGoogleDocs()
         const docId = selectedDocId || refreshed?.selectedId || ''
@@ -993,6 +1148,22 @@ export default function App() {
         setCoverLetterStatus('Cover letter generated.')
         return
       }
+      if (mode === 'docx') {
+        if (!docxDraftId) {
+          setError('No DOCX draft available. Please optimize first.')
+          return
+        }
+        const res = await axios.post(`${BACKEND_URL}/docx/coverletter`, {
+          draft_id: docxDraftId,
+          job_description: jobDescription,
+        })
+        const coverLetter = res.data?.cover_letter
+        if (typeof coverLetter === 'string') {
+          setCoverLetterText(coverLetter)
+        }
+        setCoverLetterStatus('Cover letter generated.')
+        return
+      }
 
       const form = new FormData()
       form.append('job_description', jobDescription)
@@ -1063,6 +1234,28 @@ export default function App() {
     const bytes = b64ToUint8Array(pdfB64)
     const filename = `${uniqueBaseName}.pdf`
     downloadBytes(bytes, filename, 'application/pdf')
+  }
+
+  async function handleDownloadDocx() {
+    if (!docxDraftId) return
+    const baseName = buildDownloadBaseName(jobDescription, userFirstName, userLastName)
+    const filename = `${baseName}.docx`
+    const res = await axios.post(
+      `${BACKEND_URL}/docx/download`,
+      { draft_id: docxDraftId, filename },
+      { responseType: 'blob' },
+    )
+    const blob = new Blob([res.data], {
+      type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = filename
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+    URL.revokeObjectURL(url)
   }
 
   function handleDownloadCoverLetter() {
@@ -1514,6 +1707,9 @@ export default function App() {
             <div className="panel">
               <div className="label">Resume source</div>
               <div className="mode-toggle">
+                <button className={`chip ${mode === 'docx' ? 'active' : ''}`} onClick={() => handleModeChange('docx')}>
+                  Word Docx
+                </button>
                 <button className={`chip ${mode === 'latex' ? 'active' : ''}`} onClick={() => handleModeChange('latex')}>
                   LaTeX Template
                 </button>
@@ -1522,7 +1718,22 @@ export default function App() {
                 </button>
               </div>
 
-              {mode === 'latex' ? (
+              {mode === 'docx' ? (
+                <>
+                  <div className="label" style={{ marginTop: 10 }}>Upload resume (.docx)</div>
+                  <input
+                    className="input"
+                    type="file"
+                    accept=".docx"
+                    onChange={(e) => setDocxFile(e.target.files?.[0] ?? null)}
+                  />
+                  <div className="actions template-actions">
+                    <button className="btn primary" disabled={!canOptimize || loading} onClick={handleOptimize}>
+                      {loading ? 'Tuning…' : 'Tweak in 30s'}
+                    </button>
+                  </div>
+                </>
+              ) : mode === 'latex' ? (
                 <>
                   <div className="template-header">
                     <div className="label" style={{ marginTop: 10 }}>Base resume template (.tex)</div>
@@ -1700,13 +1911,15 @@ export default function App() {
           </div>
         )}
 
-        {mode === 'latex' && draft && (uiStep === 'edit' || uiStep === 'export') && (
+        {(mode === 'latex' || mode === 'docx') && draft && (uiStep === 'edit' || uiStep === 'export') && (
           <div className="edit-layout" ref={editPanelRef}>
             <div className="edit-col">
               <div className="panel edit-downloads">
                 <div className="preview-head">
                   <div className="h2">Downloads</div>
-                  <div className="small subtle">Export the latest draft as .tex or PDF.</div>
+                  <div className="small subtle">
+                    {mode === 'docx' ? 'Export the latest draft as .docx.' : 'Export the latest draft as .tex or PDF.'}
+                  </div>
                 </div>
                 <div className="actions">
                   {mode === 'latex' && (
@@ -1719,6 +1932,11 @@ export default function App() {
                       </button>
                     </>
                   )}
+                  {mode === 'docx' && (
+                    <button className="btn primary" disabled={!docxAvailable} onClick={handleDownloadDocx}>
+                      Download DOCX
+                    </button>
+                  )}
                 </div>
                 {estimatedPdfPages > 1 && (
                   <div className="status-row">
@@ -1730,7 +1948,11 @@ export default function App() {
                 <div className="preview-head">
                   <div className="h2">Preview</div>
                   <div className="small subtle">
-                    {mode === 'latex' ? 'PDF preview (compiled from LaTeX).' : 'Preview not available for Google Docs.'}
+                    {mode === 'latex'
+                      ? 'PDF preview (compiled from LaTeX).'
+                      : mode === 'docx'
+                        ? 'Preview not available for DOCX.'
+                        : 'Preview not available for Google Docs.'}
                   </div>
                 </div>
                 {mode === 'latex' ? (
@@ -1740,7 +1962,9 @@ export default function App() {
                     <div className="preview">No preview yet.</div>
                   )
                 ) : (
-                  <div className="preview">Preview not available for Google Docs.</div>
+                  <div className="preview">
+                    {mode === 'docx' ? 'Preview not available for DOCX.' : 'Preview not available for Google Docs.'}
+                  </div>
                 )}
               </div>
               <div className="panel saved-panel">
@@ -1805,12 +2029,61 @@ export default function App() {
                     </div>
                   </div>
                 )}
-                <ResumeEditorStructured
-                  draftExperiences={draftExperiences}
-                  draftProjects={draftProjects}
-                  skillsText={draft.skills || ''}
-                  onApply={handleApplyChanges}
-                />
+                {mode === 'docx' ? (
+                  <div className="onlyoffice-editor">
+                    <div className="preview-head">
+                      <div className="h2">DOCX Editor</div>
+                      <div className="actions">
+                        <button className="btn" type="button" onClick={handleOnlyOfficeSave}>
+                          Save Changes
+                        </button>
+                      </div>
+                    </div>
+                    {onlyOfficeLoading && (
+                      <div className="small subtle">Loading editor…</div>
+                    )}
+                    {onlyOfficeError && (
+                      <div className="small subtle" style={{ color: '#ff9a9a' }}>
+                        {onlyOfficeError}
+                      </div>
+                    )}
+                    {!onlyOfficeLoading && !onlyOfficeError && onlyOfficeUrl && (
+                      <iframe
+                        ref={onlyOfficeFrameRef}
+                        src={onlyOfficeUrl}
+                        title="OnlyOffice Editor"
+                        width="100%"
+                        height="800px"
+                        style={{ border: 'none', borderRadius: 12 }}
+                        onLoad={() => {
+                          setOnlyOfficeLoaded(true)
+                          setOnlyOfficeLoading(false)
+                          if (onlyOfficeTimerRef.current) {
+                            window.clearTimeout(onlyOfficeTimerRef.current)
+                          }
+                          console.log('OnlyOffice iframe loaded.')
+                        }}
+                        onError={() => {
+                          setOnlyOfficeLastError('iframe load failed')
+                          setOnlyOfficeError('OnlyOffice iframe failed to load.')
+                          setOnlyOfficeLoading(false)
+                          console.error('OnlyOffice iframe failed to load.')
+                        }}
+                      />
+                    )}
+                    {!onlyOfficeLoaded && onlyOfficeLoading && (
+                      <div className="small subtle">Connecting to editor…</div>
+                    )}
+                  </div>
+                ) : (
+                  <ResumeEditorStructured
+                    draftExperiences={draftExperiences}
+                    draftProjects={draftProjects}
+                    skillsText={draft.skills || ''}
+                    onApply={handleApplyChanges}
+                    showEmptyMeta={mode === 'docx'}
+                  />
+                )}
               </div>
             </div>
           </div>
