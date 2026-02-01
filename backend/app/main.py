@@ -144,23 +144,32 @@ def validate_database_url() -> None:
     Base.metadata.create_all(bind=engine)
 
 
-_allowed_origins = [
+from urllib.parse import urlparse
+import os
+
+_allowed_origins = {
     "http://localhost:5173",
     "http://127.0.0.1:5173",
-    "http://localhost:3000",     # future-proof
+    "http://localhost:3000",
     "http://127.0.0.1:3000",
-]
-frontend_origin = os.getenv("FRONTEND_ORIGIN", "").strip()
+}
+
+# Add frontend origins from env (comma-separated)
+frontend_origin = os.getenv("FRONTEND_ORIGIN", "")
 if frontend_origin:
-    _allowed_origins.append(frontend_origin)
-if "http://localhost:8082" not in _allowed_origins:
-    _allowed_origins.append("http://localhost:8082")
-if "http://127.0.0.1:8082" not in _allowed_origins:
-    _allowed_origins.append("http://127.0.0.1:8082")
+    for origin in frontend_origin.split(","):
+        _allowed_origins.add(origin.strip())
+
+# Add OnlyOffice URL origin
+ONLYOFFICE_URL = os.getenv("ONLYOFFICE_URL")
 if ONLYOFFICE_URL:
-    parsed_onlyoffice = urlparse(ONLYOFFICE_URL)
-    if parsed_onlyoffice.scheme and parsed_onlyoffice.netloc:
-        _allowed_origins.append(f"{parsed_onlyoffice.scheme}://{parsed_onlyoffice.netloc}")
+    parsed = urlparse(ONLYOFFICE_URL)
+    if parsed.scheme and parsed.netloc:
+        _allowed_origins.add(f"{parsed.scheme}://{parsed.netloc}")
+
+# Convert set to list for CORSMiddleware
+_allowed_origins = list(_allowed_origins)
+
 
 EXPERIENCE_SECTION_NAMES = [
     "Experience",
