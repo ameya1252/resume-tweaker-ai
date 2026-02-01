@@ -233,6 +233,12 @@ export default function App() {
   const [onlyOfficeError, setOnlyOfficeError] = useState<string | null>(null)
   const [onlyOfficeLoaded, setOnlyOfficeLoaded] = useState(false)
   const [onlyOfficeLastError, setOnlyOfficeLastError] = useState<string | null>(null)
+  const [onlyOfficeFailed, setOnlyOfficeFailed] = useState(false)
+  const [onlyOfficeDiag, setOnlyOfficeDiag] = useState<{
+    health?: { ok: boolean; status?: number; data?: any; error?: string }
+    config?: { ok: boolean; status?: number; data?: any; error?: string }
+    file?: { ok: boolean; status?: number; error?: string }
+  }>({})
   const [outreachPreview, setOutreachPreview] = useState<{
     target_roles: string[]
     linkedin_searches: Array<{ label: string; url: string }>
@@ -256,6 +262,7 @@ export default function App() {
       return ''
     }
   }, [])
+  const useOnlyOffice = true
 
   const isAuthenticated = !!sessionToken
   const userInitial = (userEmail.trim()[0] || 'U').toUpperCase()
@@ -277,11 +284,22 @@ export default function App() {
   }, [selectedDocId])
 
   useEffect(() => {
+    if (!useOnlyOffice) {
+      setOnlyOfficeUrl('')
+      setOnlyOfficeError(null)
+      setOnlyOfficeLoading(false)
+      setOnlyOfficeLoaded(false)
+      setOnlyOfficeFailed(false)
+      setOnlyOfficeDiag({})
+      return
+    }
     if (mode !== 'docx' || !docxDraftId || (uiStep !== 'edit' && uiStep !== 'export')) {
       setOnlyOfficeUrl('')
       setOnlyOfficeError(null)
       setOnlyOfficeLoading(false)
       setOnlyOfficeLoaded(false)
+      setOnlyOfficeFailed(false)
+      setOnlyOfficeDiag({})
       return
     }
     if (!ONLYOFFICE_URL) {
@@ -289,6 +307,7 @@ export default function App() {
       setOnlyOfficeUrl('')
       setOnlyOfficeLoading(false)
       setOnlyOfficeLoaded(false)
+      setOnlyOfficeFailed(false)
       return
     }
     const configEndpoint = `${BACKEND_URL}/docx/editor/${encodeURIComponent(docxDraftId)}`
@@ -296,8 +315,10 @@ export default function App() {
     setOnlyOfficeUrl(url)
     setOnlyOfficeLoading(true)
     setOnlyOfficeLoaded(false)
+    setOnlyOfficeFailed(false)
     setOnlyOfficeError(null)
     setOnlyOfficeLastError(null)
+    setOnlyOfficeDiag({})
     console.log('OnlyOffice draftId:', docxDraftId)
     console.log('OnlyOffice configUrl:', configEndpoint)
     console.log('OnlyOffice iframe src:', url)
@@ -307,6 +328,8 @@ export default function App() {
     onlyOfficeTimerRef.current = window.setTimeout(() => {
       setOnlyOfficeLoading(false)
       setOnlyOfficeError('OnlyOffice editor is taking too long to load.')
+      setOnlyOfficeFailed(true)
+      setOnlyOfficeLoaded(false)
       console.error('OnlyOffice iframe timeout. Last error:', onlyOfficeLastError)
     }, 5000)
     return () => {
@@ -314,7 +337,62 @@ export default function App() {
         window.clearTimeout(onlyOfficeTimerRef.current)
       }
     }
-  }, [mode, docxDraftId, uiStep, onlyOfficeLastError])
+  }, [mode, docxDraftId, uiStep, onlyOfficeLastError, useOnlyOffice])
+
+  useEffect(() => {
+    if (!useOnlyOffice) return
+    let active = true
+    async function runDiagnostics() {
+      if (mode !== 'docx' || !docxDraftId || (uiStep !== 'edit' && uiStep !== 'export')) return
+      const configEndpoint = `${BACKEND_URL}/docx/editor/${encodeURIComponent(docxDraftId)}`
+      const healthEndpoint = `${BACKEND_URL}/docx/editor/health`
+      const nextDiag: {
+        health?: { ok: boolean; status?: number; data?: any; error?: string }
+        config?: { ok: boolean; status?: number; data?: any; error?: string }
+        file?: { ok: boolean; status?: number; error?: string }
+      } = {}
+      try {
+        const res = await axios.get(healthEndpoint)
+        nextDiag.health = { ok: true, status: res.status, data: res.data }
+      } catch (e: any) {
+        nextDiag.health = {
+          ok: false,
+          status: e?.response?.status,
+          error: e?.response?.data?.detail || e?.message || 'Health check failed.',
+        }
+      }
+      try {
+        const res = await axios.get(configEndpoint)
+        nextDiag.config = { ok: true, status: res.status, data: res.data }
+      } catch (e: any) {
+        nextDiag.config = {
+          ok: false,
+          status: e?.response?.status,
+          error: e?.response?.data?.detail || e?.message || 'Config fetch failed.',
+        }
+      }
+      const fileUrl = nextDiag.config?.ok ? nextDiag.config?.data?.document?.url : null
+      if (fileUrl) {
+        try {
+          const res = await axios.get(fileUrl, { responseType: 'arraybuffer' })
+          nextDiag.file = { ok: true, status: res.status }
+        } catch (e: any) {
+          nextDiag.file = {
+            ok: false,
+            status: e?.response?.status,
+            error: e?.response?.data?.detail || e?.message || 'File fetch failed.',
+          }
+        }
+      }
+      if (active) {
+        setOnlyOfficeDiag(nextDiag)
+      }
+    }
+    runDiagnostics()
+    return () => {
+      active = false
+    }
+  }, [mode, docxDraftId, uiStep, useOnlyOffice])
 
   const handleOnlyOfficeSave = useCallback(() => {
     if (!onlyOfficeFrameRef.current?.contentWindow) return
@@ -818,7 +896,6 @@ export default function App() {
         if (draftPayload) {
           setDraft(draftPayload)
           setDocxAvailable(!!res.data?.docx_available)
-          setPdfAvailable(!!res.data?.pdf_available)
           setUiStep('edit')
         }
         return
@@ -1055,9 +1132,9 @@ export default function App() {
           throw new Error('No DOCX draft returned.')
         }
         setDraft(draftPayload)
-        setDocxDraftId(res.data?.draft_id || null)
+        const nextDraftId = res.data?.draft_id || null
+        setDocxDraftId(nextDraftId)
         setDocxAvailable(!!res.data?.docx_available)
-        setPdfAvailable(!!res.data?.pdf_available)
         setScoreBefore(60 + Math.floor(Math.random() * 11))
         setScoreAfter(85 + Math.floor(Math.random() * 11))
         nextStep = 'edit'
@@ -1912,181 +1989,248 @@ export default function App() {
         )}
 
         {(mode === 'latex' || mode === 'docx') && draft && (uiStep === 'edit' || uiStep === 'export') && (
-          <div className="edit-layout" ref={editPanelRef}>
-            <div className="edit-col">
-              <div className="panel edit-downloads">
-                <div className="preview-head">
-                  <div className="h2">Downloads</div>
-                  <div className="small subtle">
-                    {mode === 'docx' ? 'Export the latest draft as .docx.' : 'Export the latest draft as .tex or PDF.'}
-                  </div>
-                </div>
-                <div className="actions">
-                  {mode === 'latex' && (
-                    <>
-                      <button className="btn" disabled={!texB64} onClick={handleDownloadTex}>
-                        Download .tex
-                      </button>
-                      <button className="btn primary" disabled={!pdfB64} onClick={handleDownloadPdf}>
-                        Download PDF
-                      </button>
-                    </>
-                  )}
-                  {mode === 'docx' && (
+          mode === 'docx' ? (
+            <div className="edit-layout single-col" ref={editPanelRef}>
+              <div className="edit-col">
+                <div className="panel docx-topbar-panel">
+                  <div className="docx-topbar">
                     <button className="btn primary" disabled={!docxAvailable} onClick={handleDownloadDocx}>
                       Download DOCX
                     </button>
-                  )}
-                </div>
-                {estimatedPdfPages > 1 && (
-                  <div className="status-row">
-                    <span className="badge warn">Estimate: Likely 2 pages</span>
-                  </div>
-                )}
-              </div>
-              <div className="panel preview-panel edit-preview" ref={previewRef}>
-                <div className="preview-head">
-                  <div className="h2">Preview</div>
-                  <div className="small subtle">
-                    {mode === 'latex'
-                      ? 'PDF preview (compiled from LaTeX).'
-                      : mode === 'docx'
-                        ? 'Preview not available for DOCX.'
-                        : 'Preview not available for Google Docs.'}
-                  </div>
-                </div>
-                {mode === 'latex' ? (
-                  pdfUrl ? (
-                    <iframe className="preview-frame" src={pdfUrl} title="Resume PDF preview" />
-                  ) : (
-                    <div className="preview">No preview yet.</div>
-                  )
-                ) : (
-                  <div className="preview">
-                    {mode === 'docx' ? 'Preview not available for DOCX.' : 'Preview not available for Google Docs.'}
-                  </div>
-                )}
-              </div>
-              <div className="panel saved-panel">
-                <div className="preview-head">
-                  <div className="h2">Saved Downloads</div>
-                  <div className="small subtle">Only resumes you download are saved here.</div>
-                </div>
-                {downloadedLoading ? (
-                  <div className="small subtle">Loading saved resumes…</div>
-                ) : downloadedResumes.length === 0 ? (
-                  <div className="small subtle">No saved resumes yet.</div>
-                ) : (
-                  <div className="saved-list">
-                    {savedPreview.map((resume) => (
-                      <div className="saved-item" key={resume.id}>
-                        <div className="saved-meta">
-                          <div className="saved-name">{resume.name}</div>
-                          <div className="small subtle">
-                            {new Date(resume.created_at).toLocaleString()}
+                    {scoreBefore !== null && scoreAfter !== null && (
+                      <div className="score-panel">
+                        <div className="score-card">
+                          <div className="score-ring">
+                            <div className="score-value">{scoreBefore}</div>
                           </div>
+                          <div className="small subtle">Before score</div>
                         </div>
-                        <div className="saved-actions">
-                          <button className="chip tiny" onClick={() => handleDownloadSaved(resume.id, 'tex')}>
-                            .tex
-                          </button>
-                          <button className="chip tiny" onClick={() => handleDownloadSaved(resume.id, 'pdf')}>
-                            PDF
-                          </button>
+                        <div className="score-arrow" aria-hidden="true">→</div>
+                        <div className="score-card">
+                          <div className="score-ring">
+                            <div className="score-value">{scoreAfter}</div>
+                          </div>
+                          <div className="small subtle">After score</div>
                         </div>
-                      </div>
-                    ))}
-                  </div>
-                )}
-                {hasMoreSaved && !downloadedLoading && (
-                  <div className="saved-footer">
-                    <button className="chip tiny" onClick={handleOpenSaved} type="button">
-                      Show more
-                    </button>
-                  </div>
-                )}
-                {downloadedError && (
-                  <div className="small subtle" style={{ color: '#ff9a9a' }}>{downloadedError}</div>
-                )}
-              </div>
-            </div>
-            <div className="edit-col">
-              <div className="edit-editor">
-                {scoreBefore !== null && scoreAfter !== null && (
-                  <div className="score-panel">
-                  <div className="score-card">
-                    <div className="score-ring">
-                      <div className="score-value">{scoreBefore}</div>
-                    </div>
-                    <div className="small subtle">Before score</div>
-                  </div>
-                  <div className="score-arrow" aria-hidden="true">→</div>
-                  <div className="score-card">
-                    <div className="score-ring">
-                      <div className="score-value">{scoreAfter}</div>
-                    </div>
-                    <div className="small subtle">After score</div>
-                    </div>
-                  </div>
-                )}
-                {mode === 'docx' ? (
-                  <div className="onlyoffice-editor">
-                    <div className="preview-head">
-                      <div className="h2">DOCX Editor</div>
-                      <div className="actions">
-                        <button className="btn" type="button" onClick={handleOnlyOfficeSave}>
-                          Save Changes
-                        </button>
-                      </div>
-                    </div>
-                    {onlyOfficeLoading && (
-                      <div className="small subtle">Loading editor…</div>
-                    )}
-                    {onlyOfficeError && (
-                      <div className="small subtle" style={{ color: '#ff9a9a' }}>
-                        {onlyOfficeError}
                       </div>
                     )}
-                    {!onlyOfficeLoading && !onlyOfficeError && onlyOfficeUrl && (
+                  </div>
+                </div>
+                <div className="panel preview-panel edit-preview" ref={previewRef}>
+                  <div className="preview-head">
+                    <div className="h2">Preview</div>
+                    <div className="small subtle">Live editor preview powered by OnlyOffice.</div>
+                  </div>
+                  {onlyOfficeError && (
+                    <div className="error">
+                      <b>Error:</b> {onlyOfficeError}
+                    </div>
+                  )}
+                  {!onlyOfficeError && onlyOfficeUrl ? (
+                    <>
                       <iframe
                         ref={onlyOfficeFrameRef}
+                        className="preview-frame"
                         src={onlyOfficeUrl}
-                        title="OnlyOffice Editor"
-                        width="100%"
-                        height="800px"
-                        style={{ border: 'none', borderRadius: 12 }}
+                        title="Resume DOCX editor"
                         onLoad={() => {
                           setOnlyOfficeLoaded(true)
                           setOnlyOfficeLoading(false)
+                          setOnlyOfficeFailed(false)
                           if (onlyOfficeTimerRef.current) {
                             window.clearTimeout(onlyOfficeTimerRef.current)
                           }
-                          console.log('OnlyOffice iframe loaded.')
                         }}
                         onError={() => {
-                          setOnlyOfficeLastError('iframe load failed')
-                          setOnlyOfficeError('OnlyOffice iframe failed to load.')
+                          setOnlyOfficeFailed(true)
+                          setOnlyOfficeLoaded(false)
                           setOnlyOfficeLoading(false)
-                          console.error('OnlyOffice iframe failed to load.')
+                          setOnlyOfficeError('OnlyOffice editor failed to load.')
                         }}
                       />
-                    )}
-                    {!onlyOfficeLoaded && onlyOfficeLoading && (
-                      <div className="small subtle">Connecting to editor…</div>
-                    )}
+                      {!onlyOfficeLoaded && onlyOfficeLoading && (
+                        <div className="small subtle">Loading editor…</div>
+                      )}
+                    </>
+                  ) : (
+                    <div className="preview">OnlyOffice preview not available.</div>
+                  )}
+                </div>
+                <div className="panel saved-panel">
+                  <div className="preview-head">
+                    <div className="h2">Saved Downloads</div>
+                    <div className="small subtle">Only resumes you download are saved here.</div>
                   </div>
-                ) : (
-                  <ResumeEditorStructured
-                    draftExperiences={draftExperiences}
-                    draftProjects={draftProjects}
-                    skillsText={draft.skills || ''}
-                    onApply={handleApplyChanges}
-                    showEmptyMeta={mode === 'docx'}
-                  />
-                )}
+                  {downloadedLoading ? (
+                    <div className="small subtle">Loading saved resumes…</div>
+                  ) : downloadedResumes.length === 0 ? (
+                    <div className="small subtle">No saved resumes yet.</div>
+                  ) : (
+                    <div className="saved-list">
+                      {savedPreview.map((resume) => (
+                        <div className="saved-item" key={resume.id}>
+                          <div className="saved-meta">
+                            <div className="saved-name">{resume.name}</div>
+                            <div className="small subtle">
+                              {new Date(resume.created_at).toLocaleString()}
+                            </div>
+                          </div>
+                          <div className="saved-actions">
+                            <button className="chip tiny" onClick={() => handleDownloadSaved(resume.id, 'tex')}>
+                              .tex
+                            </button>
+                            <button className="chip tiny" onClick={() => handleDownloadSaved(resume.id, 'pdf')}>
+                              PDF
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  {hasMoreSaved && !downloadedLoading && (
+                    <div className="saved-footer">
+                      <button className="chip tiny" onClick={handleOpenSaved} type="button">
+                        Show more
+                      </button>
+                    </div>
+                  )}
+                  {downloadedError && (
+                    <div className="small subtle" style={{ color: '#ff9a9a' }}>{downloadedError}</div>
+                  )}
+                </div>
               </div>
             </div>
-          </div>
+          ) : (
+            <div className="edit-layout" ref={editPanelRef}>
+              <div className="edit-col">
+                <div className="panel edit-downloads">
+                  <div className="preview-head">
+                    <div className="h2">Downloads</div>
+                    <div className="small subtle">
+                      {mode === 'docx' ? 'Export the latest draft as .docx.' : 'Export the latest draft as .tex or PDF.'}
+                    </div>
+                  </div>
+                  <div className="actions">
+                    {mode === 'latex' && (
+                      <>
+                        <button className="btn" disabled={!texB64} onClick={handleDownloadTex}>
+                          Download .tex
+                        </button>
+                        <button className="btn primary" disabled={!pdfB64} onClick={handleDownloadPdf}>
+                          Download PDF
+                        </button>
+                      </>
+                    )}
+                    {mode === 'docx' && (
+                      <button className="btn primary" disabled={!docxAvailable} onClick={handleDownloadDocx}>
+                        Download DOCX
+                      </button>
+                    )}
+                  </div>
+                  {estimatedPdfPages > 1 && (
+                    <div className="status-row">
+                      <span className="badge warn">Estimate: Likely 2 pages</span>
+                    </div>
+                  )}
+                </div>
+                <div className="panel preview-panel edit-preview" ref={previewRef}>
+                  <div className="preview-head">
+                    <div className="h2">Preview</div>
+                    <div className="small subtle">
+                      {mode === 'latex'
+                        ? 'PDF preview (compiled from LaTeX).'
+                        : mode === 'docx'
+                          ? 'PDF preview of your optimized DOCX.'
+                          : 'Preview not available for Google Docs.'}
+                    </div>
+                  </div>
+                  {(mode === 'latex' || mode === 'docx') ? (
+                    pdfUrl ? (
+                      <iframe className="preview-frame" src={pdfUrl} title="Resume PDF preview" />
+                    ) : (
+                      <div className="preview">PDF preview not available.</div>
+                    )
+                  ) : (
+                    <div className="preview">Preview not available.</div>
+                  )}
+                </div>
+                <div className="panel saved-panel">
+                  <div className="preview-head">
+                    <div className="h2">Saved Downloads</div>
+                    <div className="small subtle">Only resumes you download are saved here.</div>
+                  </div>
+                  {downloadedLoading ? (
+                    <div className="small subtle">Loading saved resumes…</div>
+                  ) : downloadedResumes.length === 0 ? (
+                    <div className="small subtle">No saved resumes yet.</div>
+                  ) : (
+                    <div className="saved-list">
+                      {savedPreview.map((resume) => (
+                        <div className="saved-item" key={resume.id}>
+                          <div className="saved-meta">
+                            <div className="saved-name">{resume.name}</div>
+                            <div className="small subtle">
+                              {new Date(resume.created_at).toLocaleString()}
+                            </div>
+                          </div>
+                          <div className="saved-actions">
+                            <button className="chip tiny" onClick={() => handleDownloadSaved(resume.id, 'tex')}>
+                              .tex
+                            </button>
+                            <button className="chip tiny" onClick={() => handleDownloadSaved(resume.id, 'pdf')}>
+                              PDF
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  {hasMoreSaved && !downloadedLoading && (
+                    <div className="saved-footer">
+                      <button className="chip tiny" onClick={handleOpenSaved} type="button">
+                        Show more
+                      </button>
+                    </div>
+                  )}
+                  {downloadedError && (
+                    <div className="small subtle" style={{ color: '#ff9a9a' }}>{downloadedError}</div>
+                  )}
+                </div>
+              </div>
+              <div className="edit-col">
+                <div className="edit-editor">
+                  {scoreBefore !== null && scoreAfter !== null && (
+                    <div className="score-panel">
+                      <div className="score-card">
+                        <div className="score-ring">
+                          <div className="score-value">{scoreBefore}</div>
+                        </div>
+                        <div className="small subtle">Before score</div>
+                      </div>
+                      <div className="score-arrow" aria-hidden="true">→</div>
+                      <div className="score-card">
+                        <div className="score-ring">
+                          <div className="score-value">{scoreAfter}</div>
+                        </div>
+                        <div className="small subtle">After score</div>
+                      </div>
+                    </div>
+                  )}
+                  {mode === 'docx' ? (
+                    null
+                  ) : (
+                    <ResumeEditorStructured
+                      draftExperiences={draftExperiences}
+                      draftProjects={draftProjects}
+                      skillsText={draft.skills || ''}
+                      onApply={handleApplyChanges}
+                      showEmptyMeta={mode === 'docx'}
+                    />
+                  )}
+                </div>
+              </div>
+            </div>
+          )
         )}
 
         {uiStep === 'edit' && (

@@ -604,6 +604,34 @@ textarea, input, button{font-family:inherit;}
   min-height:calc(100vh - 220px);
   animation:edit-enter 240ms ease;
 }
+.edit-layout.single-col{
+  display:flex;
+  flex-direction:column;
+  gap:12px;
+  margin-top:8px;
+  align-items:center;
+  min-height:auto;
+}
+.edit-layout.single-col .edit-col{
+  width:100%;
+  max-width:900px;
+}
+.edit-layout.single-col .edit-editor{
+  margin-bottom:0;
+}
+.docx-topbar{
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+  margin-bottom:8px;
+  transform:translateY(4.5px);
+}
+.docx-topbar .score-panel{
+  margin-left:12px;
+}
+.docx-topbar-panel{
+  padding:2px 14px;
+}
 .edit-col{
   display:flex;
   flex-direction:column;
@@ -735,8 +763,8 @@ textarea, input, button{font-family:inherit;}
   display:flex;
   flex-direction:column;
   flex:1;
-  min-height:0;
-  overflow:auto;
+  min-height:auto;
+  overflow:visible;
 }
 .preview-readonly{
   min-height:200px;
@@ -1052,16 +1080,13 @@ textarea, input, button{font-family:inherit;}
   color:#111827;
   border-radius:12px;
   padding:18px;
-  overflow:auto;
+  overflow:visible;
   flex:1;
-  max-height:none;
-  min-height:clamp(620px, 80vh, 1040px);
 }
 .preview-frame{
   width:100%;
-  height:clamp(620px, 80vh, 1040px);
-  flex:1;
-  min-height:0;
+  height:85vh;
+  min-height:800px;
   border:none;
   border-radius:12px;
   background:#ffffff;

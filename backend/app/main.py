@@ -4,14 +4,13 @@ import io
 import logging
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import time
 import uuid
 import base64
-import hashlib
-import hmac
-import urllib.request
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple, Union
 from urllib.parse import quote, urlparse
@@ -19,7 +18,7 @@ from urllib.parse import quote, urlparse
 from dotenv import load_dotenv
 from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from openai import OpenAI
 from passlib.context import CryptContext
 from pydantic import BaseModel, Field
@@ -31,6 +30,7 @@ from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from docx import Document
+import jwt
 
 from db import Base, SessionLocal, engine
 from models import DocxDraft, DownloadedResume, GoogleCredential, GoogleOAuthState, Resume, WaitlistEntry
@@ -51,6 +51,7 @@ GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI", "").strip()
 GOOGLE_CLIENT_TYPE = os.getenv("GOOGLE_CLIENT_TYPE", "web").strip().lower()
 ONLYOFFICE_URL = os.getenv("ONLYOFFICE_URL", "").strip()
 ONLYOFFICE_JWT_SECRET = os.getenv("ONLYOFFICE_JWT_SECRET", "").strip()
+ONLYOFFICE_BACKEND_BASE_URL = os.getenv("ONLYOFFICE_BACKEND_BASE_URL", "").strip()
 BACKEND_BASE_URL = os.getenv("BACKEND_BASE_URL", "").strip()
 
 if os.getenv("OAUTHLIB_INSECURE_TRANSPORT") is None and GOOGLE_REDIRECT_URI.startswith("http://localhost"):
@@ -154,6 +155,8 @@ if frontend_origin:
     _allowed_origins.append(frontend_origin)
 if "http://localhost:8082" not in _allowed_origins:
     _allowed_origins.append("http://localhost:8082")
+if "http://127.0.0.1:8082" not in _allowed_origins:
+    _allowed_origins.append("http://127.0.0.1:8082")
 if ONLYOFFICE_URL:
     parsed_onlyoffice = urlparse(ONLYOFFICE_URL)
     if parsed_onlyoffice.scheme and parsed_onlyoffice.netloc:
@@ -576,50 +579,14 @@ def _detect_docx_section_type(text: str) -> Optional[str]:
     return None
 
 
-def _base64url_encode(raw: bytes) -> str:
-    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
-
-
-def _base64url_decode(raw: str) -> bytes:
-    padded = raw + "=" * (-len(raw) % 4)
-    return base64.urlsafe_b64decode(padded.encode("ascii"))
-
-
-def _onlyoffice_sign(payload: Dict[str, object]) -> str:
+def sign_onlyoffice_jwt(payload: Dict[str, object]) -> str:
     if not ONLYOFFICE_JWT_SECRET:
         return ""
-    header = {"alg": "HS256", "typ": "JWT"}
-    header_b64 = _base64url_encode(json.dumps(header, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
-    payload_b64 = _base64url_encode(json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
-    signing_input = f"{header_b64}.{payload_b64}".encode("ascii")
-    signature = hmac.new(ONLYOFFICE_JWT_SECRET.encode("utf-8"), signing_input, hashlib.sha256).digest()
-    signature_b64 = _base64url_encode(signature)
-    return f"{header_b64}.{payload_b64}.{signature_b64}"
-
-
-def _onlyoffice_verify(token: str) -> Optional[Dict[str, object]]:
-    if not ONLYOFFICE_JWT_SECRET or not token:
-        return None
-    parts = token.split(".")
-    if len(parts) != 3:
-        return None
-    header_b64, payload_b64, sig_b64 = parts
-    signing_input = f"{header_b64}.{payload_b64}".encode("ascii")
-    expected = hmac.new(ONLYOFFICE_JWT_SECRET.encode("utf-8"), signing_input, hashlib.sha256).digest()
-    try:
-        received = _base64url_decode(sig_b64)
-    except Exception:
-        return None
-    if not hmac.compare_digest(expected, received):
-        return None
-    try:
-        payload_raw = _base64url_decode(payload_b64)
-        decoded = json.loads(payload_raw.decode("utf-8"))
-    except Exception:
-        return None
-    if isinstance(decoded, dict):
-        return decoded
-    return None
+    now = datetime.now(timezone.utc)
+    payload_with_claims = dict(payload)
+    payload_with_claims["iat"] = int(now.timestamp())
+    payload_with_claims["exp"] = int((now + timedelta(minutes=10)).timestamp())
+    return jwt.encode(payload_with_claims, ONLYOFFICE_JWT_SECRET, algorithm="HS256")
 
 
 def _is_docx_heading(paragraph) -> bool:
@@ -640,10 +607,27 @@ def _is_docx_bullet(paragraph) -> bool:
     return "list" in style_name.lower()
 
 
-def _set_docx_paragraph_text(paragraph, text: str) -> None:
-    for run in paragraph.runs:
-        run.text = ""
-    paragraph.add_run(text)
+def replace_paragraph_text_preserve_format(paragraph, new_text: str) -> None:
+    """
+    Replace the visible text of a paragraph while preserving:
+    - font family
+    - font size
+    - bold/italic/underline
+    - bullet / numbering style
+    - indentation and spacing
+    """
+    sanitized = " ".join(str(new_text).splitlines()).replace("\t", " ").strip()
+    p = paragraph._p
+    pPr = p.pPr
+    pPr_snapshot = deepcopy(pPr) if pPr is not None else None
+    if paragraph.runs:
+        paragraph.runs[0].text = sanitized
+        for run in paragraph.runs[1:]:
+            run.text = ""
+    else:
+        paragraph.add_run(sanitized)
+    if pPr_snapshot is not None:
+        p._pPr = pPr_snapshot
 
 
 def _extract_docx_text(doc: Document) -> str:
@@ -3072,7 +3056,7 @@ def optimize_docx_resume(
         new_text = rewritten_bullets.get(slot["id"], slot["text"])
         if len(new_text) > int(slot["max_chars"]):
             raise HTTPException(status_code=500, detail="AI produced a bullet that exceeds max characters.")
-        _set_docx_paragraph_text(doc.paragraphs[para_idx], new_text)
+        replace_paragraph_text_preserve_format(doc.paragraphs[para_idx], new_text)
 
     if skills_indices:
         skills_text = "\n".join([doc.paragraphs[i].text.strip() for i in skills_indices if doc.paragraphs[i].text.strip()])
@@ -3087,7 +3071,7 @@ def optimize_docx_resume(
             if len(lines) != len(skills_indices):
                 raise HTTPException(status_code=500, detail="AI returned unexpected skills line count.")
             for para_idx, line in zip(skills_indices, lines):
-                _set_docx_paragraph_text(doc.paragraphs[para_idx], line)
+                replace_paragraph_text_preserve_format(doc.paragraphs[para_idx], line)
 
     bullet_map = []
     for slot, para_idx in zip(slots, bullet_indices):
@@ -3126,7 +3110,6 @@ def optimize_docx_resume(
     return {
         "draft_id": draft.id,
         "draft": preview,
-        "pdf_available": False,
         "docx_available": True,
     }
 
@@ -3161,14 +3144,14 @@ def apply_docx_draft(
         max_chars = int(item.get("max_chars", 130))
         if len(new_text) > max_chars:
             raise HTTPException(status_code=400, detail="Bullet exceeds max characters.")
-        _set_docx_paragraph_text(doc.paragraphs[int(item["paragraph_index"])], new_text)
+        replace_paragraph_text_preserve_format(doc.paragraphs[int(item["paragraph_index"])], new_text)
 
     if payload.skills is not None:
         lines = [line.strip() for line in payload.skills.replace("\r", "").splitlines() if line.strip()]
         if len(lines) != len(skills_indices):
             raise HTTPException(status_code=400, detail="Skills line count must remain the same.")
         for para_idx, line in zip(skills_indices, lines):
-            _set_docx_paragraph_text(doc.paragraphs[int(para_idx)], line)
+            replace_paragraph_text_preserve_format(doc.paragraphs[int(para_idx)], line)
 
     out = io.BytesIO()
     doc.save(out)
@@ -3184,7 +3167,6 @@ def apply_docx_draft(
     preview = _docx_preview_from_indices(doc, bullet_map, skills_indices)
     return {
         "draft": preview,
-        "pdf_available": False,
         "docx_available": True,
     }
 
@@ -3211,36 +3193,6 @@ def download_docx_draft(
     )
 
 
-@app.get("/docx/editor/{draft_id}")
-def docx_editor_config(
-    draft_id: str,
-    request: Request,
-    db: OrmSession = Depends(get_db),
-):
-    draft = db.query(DocxDraft).filter(DocxDraft.id == draft_id).first()
-    if not draft:
-        raise HTTPException(status_code=404, detail="DOCX draft not found.")
-    backend_base = (BACKEND_BASE_URL or "http://host.docker.internal:8000").rstrip("/")
-    file_url = f"{backend_base}/docx/editor/file/{draft_id}"
-    callback_url = f"{backend_base}/docx/editor/callback/{draft_id}"
-    config: Dict[str, object] = {
-        "documentType": "word",
-        "document": {
-            "fileType": "docx",
-            "key": draft_id,
-            "title": "resume.docx",
-            "url": file_url,
-        },
-        "editorConfig": {
-            "callbackUrl": callback_url,
-            "mode": "edit",
-        },
-    }
-    logger.info("OnlyOffice editor config: %s", json.dumps(config))
-    logger.info("OnlyOffice URLs: file_url=%s callback_url=%s", file_url, callback_url)
-    return config
-
-
 @app.get("/docx/editor/file/{draft_id}", name="docx_editor_file")
 def docx_editor_file(
     draft_id: str,
@@ -3250,11 +3202,12 @@ def docx_editor_file(
     if not draft:
         logger.info("OnlyOffice file fetch: draft_id=%s status=404", draft_id)
         raise HTTPException(status_code=404, detail="DOCX draft not found.")
-    response = Response(
-        content=draft.docx_bytes,
+    response = StreamingResponse(
+        io.BytesIO(draft.docx_bytes),
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         headers={
             "Content-Disposition": "inline; filename=resume.docx",
+            "Cache-Control": "no-store",
             "Access-Control-Allow-Origin": "*",
             "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
             "Access-Control-Allow-Headers": "*",
@@ -3264,42 +3217,23 @@ def docx_editor_file(
     return response
 
 
-@app.post("/docx/editor/callback/{draft_id}", name="docx_editor_callback")
-async def docx_editor_callback(
+@app.head("/docx/editor/file/{draft_id}")
+def docx_editor_file_head(
     draft_id: str,
-    request: Request,
     db: OrmSession = Depends(get_db),
 ):
-    payload = await request.json()
-    status = payload.get("status") if isinstance(payload, dict) else None
-    if status not in {2, 6}:
-        return JSONResponse({"error": 0})
-
-    file_url = payload.get("url") if isinstance(payload, dict) else None
-    if not file_url:
-        return JSONResponse({"error": 1})
-
-    logger.info("OnlyOffice callback save event: draft_id=%s status=%s", draft_id, status)
-    try:
-        with urllib.request.urlopen(file_url, timeout=20) as resp:
-            updated_bytes = resp.read()
-    except Exception:
-        return JSONResponse({"error": 1})
-    if not updated_bytes:
-        return JSONResponse({"error": 1})
-
     draft = db.query(DocxDraft).filter(DocxDraft.id == draft_id).first()
     if not draft:
-        return JSONResponse({"error": 1})
-    draft.docx_bytes = updated_bytes
-    try:
-        db.add(draft)
-        db.commit()
-    except SQLAlchemyError:
-        db.rollback()
-        return JSONResponse({"error": 1})
-    logger.info("OnlyOffice draft saved: draft_id=%s bytes=%s", draft_id, len(updated_bytes))
-    return JSONResponse({"error": 0})
+        raise HTTPException(status_code=404, detail="DOCX draft not found.")
+    return Response(
+        status_code=200,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={
+            "Content-Disposition": "inline; filename=resume.docx",
+            "Cache-Control": "no-store",
+            "Content-Length": str(len(draft.docx_bytes)),
+        },
+    )
 
 
 @app.get("/docx/editor/health")
@@ -3309,6 +3243,73 @@ def docx_editor_health():
         "jwt_enabled": bool(ONLYOFFICE_JWT_SECRET),
         "status": "ok",
     }
+
+
+@app.get("/docx/editor/{draft_id}")
+def docx_editor_config(
+    draft_id: str,
+    request: Request,
+    db: OrmSession = Depends(get_db),
+):
+    draft = db.query(DocxDraft).filter(DocxDraft.id == draft_id).first()
+    if not draft:
+        raise HTTPException(status_code=404, detail="DOCX draft not found.")
+    if ONLYOFFICE_BACKEND_BASE_URL:
+        backend_base = ONLYOFFICE_BACKEND_BASE_URL
+    elif BACKEND_BASE_URL:
+        backend_base = BACKEND_BASE_URL
+    else:
+        backend_base = str(request.base_url)
+    backend_base = backend_base.rstrip("/")
+    file_url = f"{backend_base}/docx/editor/file/{draft_id}"
+    callback_url = f"{backend_base}/docx/editor/callback/{draft_id}"
+    config: Dict[str, object] = {
+        "documentType": "word",
+        "document": {
+            "fileType": "docx",
+            "key": draft_id,
+            "title": "resume.docx",
+            "url": file_url,
+            "permissions": {
+                "edit": True,
+                "download": True,
+                "print": True,
+                "comment": True,
+                "review": True,
+            },
+        },
+        "editorConfig": {
+            "callbackUrl": callback_url,
+            "mode": "edit",
+            "user": {
+                "id": "local-user",
+                "name": "Local User",
+            },
+        },
+    }
+    if ONLYOFFICE_JWT_SECRET:
+        config["token"] = sign_onlyoffice_jwt(config)
+    logger.info("OnlyOffice editor config: %s", json.dumps(config))
+    logger.info("OnlyOffice URLs: file_url=%s callback_url=%s", file_url, callback_url)
+    return config
+
+
+@app.head("/docx/editor/{draft_id}")
+def docx_editor_config_head(
+    draft_id: str,
+):
+    return Response(status_code=200, media_type="application/json")
+
+
+@app.post("/docx/editor/callback/{draft_id}", name="docx_editor_callback")
+async def docx_editor_callback(
+    draft_id: str,
+    request: Request,
+    db: OrmSession = Depends(get_db),
+):
+    payload = await request.json()
+    logger.info("OnlyOffice callback payload: %s", json.dumps(payload))
+    return JSONResponse({"error": 0})
 
 
 @app.post("/docx/coverletter")

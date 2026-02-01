@@ -14,9 +14,9 @@ if [[ ! -x "$PYTHON_BIN" ]]; then
 fi
 
 if [[ -x "$UVICORN_BIN" ]]; then
-  BACKEND_CMD=("$UVICORN_BIN" "app.main:app" "--reload" "--port" "8000")
+  BACKEND_CMD=("$UVICORN_BIN" "app.main:app" "--reload" "--host" "0.0.0.0" "--port" "8000")
 else
-  BACKEND_CMD=("$PYTHON_BIN" "-m" "uvicorn" "app.main:app" "--reload" "--port" "8000")
+  BACKEND_CMD=("$PYTHON_BIN" "-m" "uvicorn" "app.main:app" "--reload" "--host" "0.0.0.0" "--port" "8000")
 fi
 
 cd "$BACKEND_DIR"
