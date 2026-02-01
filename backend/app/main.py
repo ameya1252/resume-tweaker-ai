@@ -147,28 +147,34 @@ def validate_database_url() -> None:
 from urllib.parse import urlparse
 import os
 
+frontend_origins = os.getenv("FRONTEND_ORIGIN", "")
+
 _allowed_origins = {
     "http://localhost:5173",
     "http://127.0.0.1:5173",
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
 }
 
-# Add frontend origins from env (comma-separated)
-frontend_origin = os.getenv("FRONTEND_ORIGIN", "")
-if frontend_origin:
-    for origin in frontend_origin.split(","):
-        _allowed_origins.add(origin.strip())
+if frontend_origins:
+    for origin in frontend_origins.split(","):
+        origin = origin.strip()
+        if origin:
+            _allowed_origins.add(origin)
 
-# Add OnlyOffice URL origin
-ONLYOFFICE_URL = os.getenv("ONLYOFFICE_URL")
-if ONLYOFFICE_URL:
-    parsed = urlparse(ONLYOFFICE_URL)
+onlyoffice_url = os.getenv("ONLYOFFICE_URL")
+if onlyoffice_url:
+    parsed = urlparse(onlyoffice_url)
     if parsed.scheme and parsed.netloc:
         _allowed_origins.add(f"{parsed.scheme}://{parsed.netloc}")
 
-# Convert set to list for CORSMiddleware
-_allowed_origins = list(_allowed_origins)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=list(_allowed_origins),
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
 
 
 EXPERIENCE_SECTION_NAMES = [
