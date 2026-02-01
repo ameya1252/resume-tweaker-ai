@@ -135,6 +135,28 @@ if any([GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REDIRECT_URI]):
 
 app = FastAPI(title="Resume Tweaker AI (Personal)", version="0.1.0")
 
+from urllib.parse import urlparse
+
+allowed_origins = {
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "https://tweakly.pro",
+}
+
+onlyoffice_url = os.getenv("ONLYOFFICE_URL")
+if onlyoffice_url:
+    parsed = urlparse(onlyoffice_url)
+    if parsed.scheme and parsed.netloc:
+        allowed_origins.add(f"{parsed.scheme}://{parsed.netloc}")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=list(allowed_origins),
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 @app.on_event("startup")
 def validate_database_url() -> None:
@@ -142,38 +164,6 @@ def validate_database_url() -> None:
         raise RuntimeError("DATABASE_URL is not set. Configure it before starting the server.")
     _validate_latexmk_installed()
     Base.metadata.create_all(bind=engine)
-
-
-from urllib.parse import urlparse
-import os
-
-frontend_origins = os.getenv("FRONTEND_ORIGIN", "")
-
-_allowed_origins = {
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-    "https://tweakly.pro",
-}
-
-if frontend_origins:
-    for origin in frontend_origins.split(","):
-        origin = origin.strip()
-        if origin:
-            _allowed_origins.add(origin)
-
-onlyoffice_url = os.getenv("ONLYOFFICE_URL")
-if onlyoffice_url:
-    parsed = urlparse(onlyoffice_url)
-    if parsed.scheme and parsed.netloc:
-        _allowed_origins.add(f"{parsed.scheme}://{parsed.netloc}")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=list(_allowed_origins),
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 
 
@@ -207,15 +197,6 @@ PROJECTS_SECTION_NAMES = [
     "Selected Projects",
 ]
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=_allowed_origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
 def _origin_from_url(url: str) -> str:
     if not url:
         return ""
@@ -229,13 +210,7 @@ def _origin_from_url(url: str) -> str:
 async def add_frame_headers(request: Request, call_next):
     response = await call_next(request)
     onlyoffice_origin = _origin_from_url(ONLYOFFICE_URL)
-    frontend_allowed = _origin_from_url(frontend_origin)
-    frame_ancestors = ["'self'"]
-    if onlyoffice_origin:
-        frame_ancestors.append(onlyoffice_origin)
-    if frontend_allowed and frontend_allowed not in frame_ancestors:
-        frame_ancestors.append(frontend_allowed)
-    response.headers.setdefault("Content-Security-Policy", f"frame-ancestors {' '.join(frame_ancestors)}")
+    response.headers["Content-Security-Policy"] = "frame-ancestors 'self' https://tweakly.pro " + (onlyoffice_origin or "")
     response.headers.pop("X-Frame-Options", None)
     return response
 
@@ -3221,7 +3196,6 @@ def docx_editor_file(
         headers={
             "Content-Disposition": "inline; filename=resume.docx",
             "Cache-Control": "no-store",
-            "Access-Control-Allow-Origin": "*",
             "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
             "Access-Control-Allow-Headers": "*",
         },
