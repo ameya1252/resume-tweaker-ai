@@ -211,7 +211,8 @@ async def add_frame_headers(request: Request, call_next):
     response = await call_next(request)
     onlyoffice_origin = _origin_from_url(ONLYOFFICE_URL)
     response.headers["Content-Security-Policy"] = "frame-ancestors 'self' https://tweakly.pro " + (onlyoffice_origin or "")
-    response.headers.pop("X-Frame-Options", None)
+    if "X-Frame-Options" in response.headers:
+        del response.headers["X-Frame-Options"]
     return response
 
 
