@@ -209,22 +209,19 @@ def _origin_from_url(url: str) -> str:
     return f"{parsed.scheme}://{parsed.netloc}"
 
 
-# @app.middleware("http")
-# async def add_frame_headers(request: Request, call_next):
-#     response = await call_next(request)
-#     onlyoffice_origin = _origin_from_url(ONLYOFFICE_URL)
-#     frontend_allowed = _origin_from_url(frontend_origin)
-#     frame_ancestors = ["'self'"]
-#     if onlyoffice_origin:
-#         frame_ancestors.append(onlyoffice_origin)
-#     if frontend_allowed and frontend_allowed not in frame_ancestors:
-#         frame_ancestors.append(frontend_allowed)
-#     response.headers.setdefault("Content-Security-Policy", f"frame-ancestors {' '.join(frame_ancestors)}")
-#     if onlyoffice_origin:
-#         response.headers.setdefault("X-Frame-Options", f"ALLOW-FROM {onlyoffice_origin}")
-#     else:
-#         response.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
-#     return response
+@app.middleware("http")
+async def add_frame_headers(request: Request, call_next):
+    response = await call_next(request)
+    onlyoffice_origin = _origin_from_url(ONLYOFFICE_URL)
+    frontend_allowed = _origin_from_url(frontend_origin)
+    frame_ancestors = ["'self'"]
+    if onlyoffice_origin:
+        frame_ancestors.append(onlyoffice_origin)
+    if frontend_allowed and frontend_allowed not in frame_ancestors:
+        frame_ancestors.append(frontend_allowed)
+    response.headers.setdefault("Content-Security-Policy", f"frame-ancestors {' '.join(frame_ancestors)}")
+    response.headers.pop("X-Frame-Options", None)
+    return response
 
 
 
@@ -3261,6 +3258,8 @@ def docx_editor_config(
     else:
         backend_base = str(request.base_url)
     backend_base = backend_base.rstrip("/")
+    if ("localhost" in backend_base or "127.0.0.1" in backend_base) and (ONLYOFFICE_BACKEND_BASE_URL or BACKEND_BASE_URL):
+        backend_base = (ONLYOFFICE_BACKEND_BASE_URL or BACKEND_BASE_URL or backend_base).rstrip("/")
     file_url = f"{backend_base}/docx/editor/file/{draft_id}"
     callback_url = f"{backend_base}/docx/editor/callback/{draft_id}"
     config: Dict[str, object] = {
@@ -3289,8 +3288,12 @@ def docx_editor_config(
     }
     if ONLYOFFICE_JWT_SECRET:
         config["token"] = sign_onlyoffice_jwt(config)
-    logger.info("OnlyOffice editor config: %s", json.dumps(config))
-    logger.info("OnlyOffice URLs: file_url=%s callback_url=%s", file_url, callback_url)
+    logger.info(
+        "OnlyOffice editor request: file_url=%s callback_url=%s token=%s",
+        file_url,
+        callback_url,
+        "present" if bool(config.get("token")) else "absent",
+    )
     return config
 
 
