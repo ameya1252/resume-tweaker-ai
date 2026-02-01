@@ -3253,11 +3253,17 @@ def docx_editor_config(
         backend_base = (ONLYOFFICE_BACKEND_BASE_URL or BACKEND_BASE_URL or backend_base).rstrip("/")
     file_url = f"{backend_base}/docx/editor/file/{draft_id}"
     callback_url = f"{backend_base}/docx/editor/callback/{draft_id}"
+    
+    # Generate a unique document key to bust OnlyOffice cache
+    # OnlyOffice caches documents by key, so we need a new key each time
+    doc_version = int(datetime.now(timezone.utc).timestamp())
+    document_key = f"{draft_id}_{doc_version}"
+    
     config: Dict[str, object] = {
         "documentType": "word",
         "document": {
             "fileType": "docx",
-            "key": draft_id,
+            "key": document_key,  # Changed from draft_id to document_key
             "title": "resume.docx",
             "url": file_url,
             "permissions": {
@@ -3280,9 +3286,10 @@ def docx_editor_config(
     if ONLYOFFICE_JWT_SECRET:
         config["token"] = sign_onlyoffice_jwt(config)
     logger.info(
-        "OnlyOffice editor request: file_url=%s callback_url=%s token=%s",
+        "OnlyOffice editor request: file_url=%s callback_url=%s key=%s token=%s",
         file_url,
         callback_url,
+        document_key,
         "present" if bool(config.get("token")) else "absent",
     )
     return config
