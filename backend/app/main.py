@@ -30,7 +30,6 @@ from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from docx import Document
-import jwt
 
 from db import Base, SessionLocal, engine
 from models import DocxDraft, DownloadedResume, GoogleCredential, GoogleOAuthState, Resume, WaitlistEntry
@@ -49,9 +48,6 @@ GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "").strip()
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "").strip()
 GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI", "").strip()
 GOOGLE_CLIENT_TYPE = os.getenv("GOOGLE_CLIENT_TYPE", "web").strip().lower()
-ONLYOFFICE_URL = os.getenv("ONLYOFFICE_URL", "").strip()
-ONLYOFFICE_JWT_SECRET = os.getenv("ONLYOFFICE_JWT_SECRET", "").strip()
-ONLYOFFICE_BACKEND_BASE_URL = os.getenv("ONLYOFFICE_BACKEND_BASE_URL", "").strip()
 BACKEND_BASE_URL = os.getenv("BACKEND_BASE_URL", "").strip()
 
 if os.getenv("OAUTHLIB_INSECURE_TRANSPORT") is None and GOOGLE_REDIRECT_URI.startswith("http://localhost"):
@@ -143,12 +139,6 @@ allowed_origins = {
     "https://tweakly.pro",
 }
 
-onlyoffice_url = os.getenv("ONLYOFFICE_URL")
-if onlyoffice_url:
-    parsed = urlparse(onlyoffice_url)
-    if parsed.scheme and parsed.netloc:
-        allowed_origins.add(f"{parsed.scheme}://{parsed.netloc}")
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=list(allowed_origins),
@@ -197,20 +187,10 @@ PROJECTS_SECTION_NAMES = [
     "Selected Projects",
 ]
 
-def _origin_from_url(url: str) -> str:
-    if not url:
-        return ""
-    parsed = urlparse(url)
-    if not parsed.scheme or not parsed.netloc:
-        return ""
-    return f"{parsed.scheme}://{parsed.netloc}"
-
-
 @app.middleware("http")
 async def add_frame_headers(request: Request, call_next):
     response = await call_next(request)
-    onlyoffice_origin = _origin_from_url(ONLYOFFICE_URL)
-    response.headers["Content-Security-Policy"] = "frame-ancestors 'self' https://tweakly.pro " + (onlyoffice_origin or "")
+    response.headers["Content-Security-Policy"] = "frame-ancestors 'self' https://tweakly.pro "
     if "X-Frame-Options" in response.headers:
         del response.headers["X-Frame-Options"]
     return response
@@ -566,16 +546,6 @@ def _detect_docx_section_type(text: str) -> Optional[str]:
     if normalized in skills_aliases or normalized.endswith("skills"):
         return "skills"
     return None
-
-
-def sign_onlyoffice_jwt(payload: Dict[str, object]) -> str:
-    if not ONLYOFFICE_JWT_SECRET:
-        return ""
-    now = datetime.now(timezone.utc)
-    payload_with_claims = dict(payload)
-    payload_with_claims["iat"] = int(now.timestamp())
-    payload_with_claims["exp"] = int((now + timedelta(minutes=10)).timestamp())
-    return jwt.encode(payload_with_claims, ONLYOFFICE_JWT_SECRET, algorithm="HS256")
 
 
 def _is_docx_heading(paragraph) -> bool:
@@ -3189,19 +3159,20 @@ def docx_editor_file(
 ):
     draft = db.query(DocxDraft).filter(DocxDraft.id == draft_id).first()
     if not draft:
-        logger.info("OnlyOffice file fetch: draft_id=%s status=404", draft_id)
+        logger.info("DOCX file fetch: draft_id=%s status=404", draft_id)
         raise HTTPException(status_code=404, detail="DOCX draft not found.")
     response = StreamingResponse(
         io.BytesIO(draft.docx_bytes),
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         headers={
-            "Content-Disposition": "inline; filename=resume.docx",
-            "Cache-Control": "no-store",
-            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+            "Content-Disposition": f"inline; filename=resume_{draft_id}.docx",
+            "Cache-Control": "public, max-age=3600",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
             "Access-Control-Allow-Headers": "*",
         },
     )
-    logger.info("OnlyOffice file fetch: draft_id=%s status=200 bytes=%s", draft_id, len(draft.docx_bytes))
+    logger.info("DOCX file fetch: draft_id=%s status=200 bytes=%s", draft_id, len(draft.docx_bytes))
     return response
 
 
@@ -3222,95 +3193,6 @@ def docx_editor_file_head(
             "Content-Length": str(len(draft.docx_bytes)),
         },
     )
-
-
-@app.get("/docx/editor/health")
-def docx_editor_health():
-    return {
-        "onlyoffice_url": ONLYOFFICE_URL,
-        "jwt_enabled": bool(ONLYOFFICE_JWT_SECRET),
-        "status": "ok",
-    }
-
-
-@app.get("/docx/editor/{draft_id}")
-def docx_editor_config(
-    draft_id: str,
-    request: Request,
-    db: OrmSession = Depends(get_db),
-):
-    draft = db.query(DocxDraft).filter(DocxDraft.id == draft_id).first()
-    if not draft:
-        raise HTTPException(status_code=404, detail="DOCX draft not found.")
-    if ONLYOFFICE_BACKEND_BASE_URL:
-        backend_base = ONLYOFFICE_BACKEND_BASE_URL
-    elif BACKEND_BASE_URL:
-        backend_base = BACKEND_BASE_URL
-    else:
-        backend_base = str(request.base_url)
-    backend_base = backend_base.rstrip("/")
-    if ("localhost" in backend_base or "127.0.0.1" in backend_base) and (ONLYOFFICE_BACKEND_BASE_URL or BACKEND_BASE_URL):
-        backend_base = (ONLYOFFICE_BACKEND_BASE_URL or BACKEND_BASE_URL or backend_base).rstrip("/")
-    file_url = f"{backend_base}/docx/editor/file/{draft_id}"
-    callback_url = f"{backend_base}/docx/editor/callback/{draft_id}"
-    
-    # Generate a unique document key to bust OnlyOffice cache
-    # OnlyOffice caches documents by key, so we need a new key each time
-    doc_version = int(datetime.now(timezone.utc).timestamp())
-    document_key = f"{draft_id}_{doc_version}"
-    
-    config: Dict[str, object] = {
-        "documentType": "word",
-        "document": {
-            "fileType": "docx",
-            "key": document_key,  # Changed from draft_id to document_key
-            "title": "resume.docx",
-            "url": file_url,
-            "permissions": {
-                "edit": True,
-                "download": True,
-                "print": True,
-                "comment": True,
-                "review": True,
-            },
-        },
-        "editorConfig": {
-            "callbackUrl": callback_url,
-            "mode": "edit",
-            "user": {
-                "id": "local-user",
-                "name": "Local User",
-            },
-        },
-    }
-    if ONLYOFFICE_JWT_SECRET:
-        config["token"] = sign_onlyoffice_jwt(config)
-    logger.info(
-        "OnlyOffice editor request: file_url=%s callback_url=%s key=%s token=%s",
-        file_url,
-        callback_url,
-        document_key,
-        "present" if bool(config.get("token")) else "absent",
-    )
-    return config
-
-
-@app.head("/docx/editor/{draft_id}")
-def docx_editor_config_head(
-    draft_id: str,
-):
-    return Response(status_code=200, media_type="application/json")
-
-
-@app.post("/docx/editor/callback/{draft_id}", name="docx_editor_callback")
-async def docx_editor_callback(
-    draft_id: str,
-    request: Request,
-    db: OrmSession = Depends(get_db),
-):
-    payload = await request.json()
-    logger.info("OnlyOffice callback payload: %s", json.dumps(payload))
-    return JSONResponse({"error": 0})
 
 
 @app.post("/docx/coverletter")

@@ -6,7 +6,6 @@ import { estimateVisualLines } from './utils/formatting'
 import { buildDraftExperiences, buildDraftProjects, Draft, DraftApplyRequest, DraftExperience, DraftProject } from './utils/draft'
 
 const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || 'http://localhost:8000'
-const ONLYOFFICE_URL = import.meta.env.VITE_ONLYOFFICE_URL || ''
 
 type GoogleDoc = { id: string; name: string }
 type DownloadedResume = { id: string; name: string; created_at: string }
@@ -166,14 +165,6 @@ function makeUniqueName(baseName: string, existingNames: string[]) {
   return candidate
 }
 
-function buildOnlyOfficeUrl(configUrl: string) {
-  if (!ONLYOFFICE_URL) return ''
-  const trimmed = ONLYOFFICE_URL.replace(/\/+$/, '')
-  const base = `${trimmed}/web-apps/apps/documenteditor/main/index.html`
-  const encoded = encodeURIComponent(configUrl)
-  return `${base}?configUrl=${encoded}`
-}
-
 export default function App() {
   const [sessionToken, setSessionToken] = useState(() => localStorage.getItem('session_token') || '')
   const [userEmail, setUserEmail] = useState(() => localStorage.getItem('user_email') || '')
@@ -228,17 +219,6 @@ export default function App() {
   const [pdfUrl, setPdfUrl] = useState<string>('')
   const [docxDraftId, setDocxDraftId] = useState<string | null>(null)
   const [docxAvailable, setDocxAvailable] = useState(false)
-  const [onlyOfficeUrl, setOnlyOfficeUrl] = useState('')
-  const [onlyOfficeLoading, setOnlyOfficeLoading] = useState(false)
-  const [onlyOfficeError, setOnlyOfficeError] = useState<string | null>(null)
-  const [onlyOfficeLoaded, setOnlyOfficeLoaded] = useState(false)
-  const [onlyOfficeLastError, setOnlyOfficeLastError] = useState<string | null>(null)
-  const [onlyOfficeFailed, setOnlyOfficeFailed] = useState(false)
-  const [onlyOfficeDiag, setOnlyOfficeDiag] = useState<{
-    health?: { ok: boolean; status?: number; data?: any; error?: string }
-    config?: { ok: boolean; status?: number; data?: any; error?: string }
-    file?: { ok: boolean; status?: number; error?: string }
-  }>({})
   const [outreachPreview, setOutreachPreview] = useState<{
     target_roles: string[]
     linkedin_searches: Array<{ label: string; url: string }>
@@ -253,8 +233,6 @@ export default function App() {
   const previewRef = useRef<HTMLDivElement | null>(null)
   const gdocsPreviewTimerRef = useRef<number | null>(null)
   const outreachKeyRef = useRef<string>('')
-  const onlyOfficeFrameRef = useRef<HTMLIFrameElement | null>(null)
-  const onlyOfficeTimerRef = useRef<number | null>(null)
   const backendOrigin = useMemo(() => {
     try {
       return new URL(BACKEND_URL).origin
@@ -262,7 +240,6 @@ export default function App() {
       return ''
     }
   }, [])
-  const useOnlyOffice = true
 
   const isAuthenticated = !!sessionToken
   const userInitial = (userEmail.trim()[0] || 'U').toUpperCase()
@@ -282,123 +259,6 @@ export default function App() {
       localStorage.removeItem('gdocs_selected_doc_id')
     }
   }, [selectedDocId])
-
-  useEffect(() => {
-    if (!useOnlyOffice) {
-      setOnlyOfficeUrl('')
-      setOnlyOfficeError(null)
-      setOnlyOfficeLoading(false)
-      setOnlyOfficeLoaded(false)
-      setOnlyOfficeFailed(false)
-      setOnlyOfficeDiag({})
-      return
-    }
-    if (mode !== 'docx' || !docxDraftId || (uiStep !== 'edit' && uiStep !== 'export')) {
-      setOnlyOfficeUrl('')
-      setOnlyOfficeError(null)
-      setOnlyOfficeLoading(false)
-      setOnlyOfficeLoaded(false)
-      setOnlyOfficeFailed(false)
-      setOnlyOfficeDiag({})
-      return
-    }
-    if (!ONLYOFFICE_URL) {
-      setOnlyOfficeError('OnlyOffice URL is not configured.')
-      setOnlyOfficeUrl('')
-      setOnlyOfficeLoading(false)
-      setOnlyOfficeLoaded(false)
-      setOnlyOfficeFailed(false)
-      return
-    }
-    const configEndpoint = `${BACKEND_URL}/docx/editor/${encodeURIComponent(docxDraftId)}`
-    const url = buildOnlyOfficeUrl(configEndpoint)
-    setOnlyOfficeUrl(url)
-    setOnlyOfficeLoading(true)
-    setOnlyOfficeLoaded(false)
-    setOnlyOfficeFailed(false)
-    setOnlyOfficeError(null)
-    setOnlyOfficeLastError(null)
-    setOnlyOfficeDiag({})
-    console.log('OnlyOffice draftId:', docxDraftId)
-    console.log('OnlyOffice configUrl:', configEndpoint)
-    console.log('OnlyOffice iframe src:', url)
-    if (onlyOfficeTimerRef.current) {
-      window.clearTimeout(onlyOfficeTimerRef.current)
-    }
-    onlyOfficeTimerRef.current = window.setTimeout(() => {
-      setOnlyOfficeLoading(false)
-      setOnlyOfficeError('OnlyOffice editor is taking too long to load.')
-      setOnlyOfficeFailed(true)
-      setOnlyOfficeLoaded(false)
-      console.error('OnlyOffice iframe timeout. Last error:', onlyOfficeLastError)
-    }, 5000)
-    return () => {
-      if (onlyOfficeTimerRef.current) {
-        window.clearTimeout(onlyOfficeTimerRef.current)
-      }
-    }
-  }, [mode, docxDraftId, uiStep, onlyOfficeLastError, useOnlyOffice])
-
-  useEffect(() => {
-    if (!useOnlyOffice) return
-    let active = true
-    async function runDiagnostics() {
-      if (mode !== 'docx' || !docxDraftId || (uiStep !== 'edit' && uiStep !== 'export')) return
-      const configEndpoint = `${BACKEND_URL}/docx/editor/${encodeURIComponent(docxDraftId)}`
-      const healthEndpoint = `${BACKEND_URL}/docx/editor/health`
-      const nextDiag: {
-        health?: { ok: boolean; status?: number; data?: any; error?: string }
-        config?: { ok: boolean; status?: number; data?: any; error?: string }
-        file?: { ok: boolean; status?: number; error?: string }
-      } = {}
-      try {
-        const res = await axios.get(healthEndpoint)
-        nextDiag.health = { ok: true, status: res.status, data: res.data }
-      } catch (e: any) {
-        nextDiag.health = {
-          ok: false,
-          status: e?.response?.status,
-          error: e?.response?.data?.detail || e?.message || 'Health check failed.',
-        }
-      }
-      try {
-        const res = await axios.get(configEndpoint)
-        nextDiag.config = { ok: true, status: res.status, data: res.data }
-      } catch (e: any) {
-        nextDiag.config = {
-          ok: false,
-          status: e?.response?.status,
-          error: e?.response?.data?.detail || e?.message || 'Config fetch failed.',
-        }
-      }
-      const fileUrl = nextDiag.config?.ok ? nextDiag.config?.data?.document?.url : null
-      if (fileUrl) {
-        try {
-          const res = await axios.get(fileUrl, { responseType: 'arraybuffer' })
-          nextDiag.file = { ok: true, status: res.status }
-        } catch (e: any) {
-          nextDiag.file = {
-            ok: false,
-            status: e?.response?.status,
-            error: e?.response?.data?.detail || e?.message || 'File fetch failed.',
-          }
-        }
-      }
-      if (active) {
-        setOnlyOfficeDiag(nextDiag)
-      }
-    }
-    runDiagnostics()
-    return () => {
-      active = false
-    }
-  }, [mode, docxDraftId, uiStep, useOnlyOffice])
-
-  const handleOnlyOfficeSave = useCallback(() => {
-    if (!onlyOfficeFrameRef.current?.contentWindow) return
-    onlyOfficeFrameRef.current.contentWindow.postMessage({ command: 'save' }, '*')
-  }, [])
-
 
   useEffect(() => {
     const handlePop = () => setRoutePath(window.location.pathname)
@@ -758,6 +618,12 @@ export default function App() {
     return selectedDocId ? `${selectedDocId}:${gdocsPreviewLoaded ? '1' : '0'}` : 'none'
   }, [selectedDocId, gdocsPreviewLoaded])
 
+  const msOfficeViewerUrl = useMemo(() => {
+    if (!docxDraftId) return ''
+    const fileUrl = `${BACKEND_URL}/docx/editor/file/${docxDraftId}`
+    return `https://view.officeapps.live.com/op/embed.aspx?src=${encodeURIComponent(fileUrl)}`
+  }, [docxDraftId])
+
 
   const estimatedPdfPages = useMemo(() => {
     if (!pdfB64) return 0
@@ -817,6 +683,12 @@ export default function App() {
           if (active) setOutreachLoading(false)
           return
         }
+        const key = `${jobDescription.trim()}::${docxDraftId}`
+        if (outreachKeyRef.current === key && outreachPreview) {
+          if (active) setOutreachLoading(false)
+          return
+        }
+        outreachKeyRef.current = key
         try {
           const res = await axios.post(`${BACKEND_URL}/docx/outreach/preview`, {
             draft_id: docxDraftId,
@@ -2019,41 +1891,16 @@ export default function App() {
                 <div className="panel preview-panel edit-preview" ref={previewRef}>
                   <div className="preview-head">
                     <div className="h2">Preview</div>
-                    <div className="small subtle">Live editor preview powered by OnlyOffice.</div>
+                    <div className="small subtle">Read-only preview powered by Microsoft Office Online.</div>
                   </div>
-                  {onlyOfficeError && (
-                    <div className="error">
-                      <b>Error:</b> {onlyOfficeError}
-                    </div>
-                  )}
-                  {!onlyOfficeError && onlyOfficeUrl ? (
-                    <>
-                      <iframe
-                        ref={onlyOfficeFrameRef}
-                        className="preview-frame"
-                        src={onlyOfficeUrl}
-                        title="Resume DOCX editor"
-                        onLoad={() => {
-                          setOnlyOfficeLoaded(true)
-                          setOnlyOfficeLoading(false)
-                          setOnlyOfficeFailed(false)
-                          if (onlyOfficeTimerRef.current) {
-                            window.clearTimeout(onlyOfficeTimerRef.current)
-                          }
-                        }}
-                        onError={() => {
-                          setOnlyOfficeFailed(true)
-                          setOnlyOfficeLoaded(false)
-                          setOnlyOfficeLoading(false)
-                          setOnlyOfficeError('OnlyOffice editor failed to load.')
-                        }}
-                      />
-                      {!onlyOfficeLoaded && onlyOfficeLoading && (
-                        <div className="small subtle">Loading editor…</div>
-                      )}
-                    </>
+                  {msOfficeViewerUrl ? (
+                    <iframe
+                      className="preview-frame"
+                      src={msOfficeViewerUrl}
+                      title="Resume DOCX preview"
+                    />
                   ) : (
-                    <div className="preview">OnlyOffice preview not available.</div>
+                    <div className="preview">Preview not available. Download the DOCX to view.</div>
                   )}
                 </div>
                 <div className="panel saved-panel">
