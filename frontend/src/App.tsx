@@ -1663,6 +1663,34 @@ export default function App() {
   ]
 
   if (!isAuthenticated) {
+    if (isLegalRoute) {
+      return (
+        <div className="page">
+          <div className="glow" />
+          <div className="container">
+            <header className="topbar">
+              <div className="brand">
+                <img className="logo-img" src="/icons/icon0.svg" alt="Tweakly" width="36" height="36" />
+                <span className="brand-name">Tweakly</span>
+              </div>
+            </header>
+            {legalContent}
+            <footer className="footer landing-footer">
+              <div className="footer-title">Built for people who geek out on clean signal.</div>
+              <div className="footer-copy">
+                Tweakly is your resume co-processor: fast iterations, minimal noise, maximal clarity.
+              </div>
+              <div className="footer-links">
+                <a href="https://tweakly.pro/privacy" className="footer-link">Privacy Policy</a>
+                <a href="https://tweakly.pro/terms" className="footer-link">Terms of Service</a>
+                <a href="https://tweakly.pro/security" className="footer-link">Security</a>
+                <a href="https://tweakly.pro/contact" className="footer-link">Contact</a>
+              </div>
+            </footer>
+          </div>
+        </div>
+      )
+    }
     return (
       <div className="page landing-page">
         <div className="glow" />
