@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
+import anthropic
 from openai import OpenAI
 from passlib.context import CryptContext
 from pydantic import BaseModel, Field
@@ -37,6 +38,9 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "").strip()
 OPENAI_MODEL_RESUME = os.getenv("OPENAI_MODEL_RESUME", OPENAI_MODEL).strip()
 OPENAI_MODEL_CHEAP = os.getenv("OPENAI_MODEL_CHEAP", OPENAI_MODEL).strip()
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
+ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6").strip()
+ANTHROPIC_MODEL_CHEAP = os.getenv("ANTHROPIC_MODEL_CHEAP", "claude-haiku-4-5-20251001").strip()
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "").strip()
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "").strip()
 GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI", "").strip()
@@ -45,12 +49,47 @@ GOOGLE_CLIENT_TYPE = os.getenv("GOOGLE_CLIENT_TYPE", "web").strip().lower()
 if os.getenv("OAUTHLIB_INSECURE_TRANSPORT") is None and GOOGLE_REDIRECT_URI.startswith("http://localhost"):
     os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
 
-if not OPENAI_API_KEY:
-    # We don't hard-fail at import time to allow health checks;
-    # endpoints will validate.
-    pass
-
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
+
+# Runtime-switchable AI provider. Can be toggled via POST /settings/ai-provider.
+current_ai_provider: str = os.getenv("AI_PROVIDER", "openai").strip().lower()
+if current_ai_provider not in ("openai", "anthropic"):
+    current_ai_provider = "openai"
+
+
+def _call_ai_raw(system: str, user: str, model_type: str = "cheap", temperature: float = 0.2) -> str:
+    """Unified AI call that dispatches to OpenAI or Claude based on current_ai_provider.
+
+    model_type: 'resume' (premium) | 'cheap' (fast/cheap)
+    Returns raw text from the model (should be JSON per the system prompt).
+    """
+    if current_ai_provider == "anthropic":
+        if anthropic_client is None:
+            raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY is not set in backend/.env")
+        model = ANTHROPIC_MODEL if model_type == "resume" else ANTHROPIC_MODEL_CHEAP
+        resp = anthropic_client.messages.create(
+            model=model,
+            max_tokens=4096,
+            system=system,
+            messages=[{"role": "user", "content": user}],
+            temperature=temperature,
+        )
+        return (resp.content[0].text or "").strip()
+    else:
+        if client is None:
+            raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set in backend/.env")
+        model = OPENAI_MODEL_RESUME if model_type == "resume" else OPENAI_MODEL_CHEAP
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            response_format={"type": "json_object"},
+            temperature=temperature,
+        )
+        return (resp.choices[0].message.content or "").strip()
 
 GOOGLE_SCOPES = [
     "https://www.googleapis.com/auth/documents",
@@ -1096,8 +1135,6 @@ def _google_cover_body_range(doc: dict) -> Tuple[int, int]:
 
 
 def _call_openai_cover_letter(job_description: str, resume_text: str) -> str:
-    if client is None:
-        raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set in backend/.env")
     if not resume_text.strip():
         raise HTTPException(status_code=400, detail="Resume text is empty; cannot generate cover letter.")
 
@@ -1106,37 +1143,25 @@ def _call_openai_cover_letter(job_description: str, resume_text: str) -> str:
         "resume_text": resume_text,
     }
 
-    resp = client.chat.completions.create(
-        model=OPENAI_MODEL_CHEAP,
-        messages=[
-            {"role": "system", "content": COVER_LETTER_INSTRUCTIONS},
-            {"role": "user", "content": json.dumps(payload)},
-        ],
-        response_format={"type": "json_object"},
-        temperature=0.2,
-    )
-
-    text = (resp.choices[0].message.content or "").strip()
+    text = _call_ai_raw(COVER_LETTER_INSTRUCTIONS, json.dumps(payload), model_type="cheap", temperature=0.2)
     if not text:
-        raise HTTPException(status_code=500, detail="OpenAI returned empty output.")
+        raise HTTPException(status_code=500, detail="AI returned empty output.")
 
     try:
         data = json.loads(text)
     except Exception:
         m = re.search(r"\{.*\}", text, re.DOTALL)
         if not m:
-            raise HTTPException(status_code=500, detail=f"Could not parse OpenAI JSON output. Raw: {text[:400]}")
+            raise HTTPException(status_code=500, detail=f"Could not parse AI JSON output. Raw: {text[:400]}")
         data = json.loads(m.group(0))
 
     cover_letter = data.get("cover_letter")
     if not isinstance(cover_letter, str) or not cover_letter.strip():
-        raise HTTPException(status_code=500, detail="OpenAI returned invalid cover letter output.")
+        raise HTTPException(status_code=500, detail="AI returned invalid cover letter output.")
     return cover_letter.strip()
 
 
 def _call_openai_cover_letter_body(job_description: str, resume_text: str) -> str:
-    if client is None:
-        raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set in backend/.env")
     if not resume_text.strip():
         raise HTTPException(status_code=400, detail="Resume text is empty; cannot generate cover letter.")
 
@@ -1145,37 +1170,25 @@ def _call_openai_cover_letter_body(job_description: str, resume_text: str) -> st
         "resume_text": resume_text,
     }
 
-    resp = client.chat.completions.create(
-        model=OPENAI_MODEL_CHEAP,
-        messages=[
-            {"role": "system", "content": COVER_LETTER_BODY_INSTRUCTIONS},
-            {"role": "user", "content": json.dumps(payload)},
-        ],
-        response_format={"type": "json_object"},
-        temperature=0.2,
-    )
-
-    text = (resp.choices[0].message.content or "").strip()
+    text = _call_ai_raw(COVER_LETTER_BODY_INSTRUCTIONS, json.dumps(payload), model_type="cheap", temperature=0.2)
     if not text:
-        raise HTTPException(status_code=500, detail="OpenAI returned empty output.")
+        raise HTTPException(status_code=500, detail="AI returned empty output.")
 
     try:
         data = json.loads(text)
     except Exception:
         m = re.search(r"\{.*\}", text, re.DOTALL)
         if not m:
-            raise HTTPException(status_code=500, detail=f"Could not parse OpenAI JSON output. Raw: {text[:400]}")
+            raise HTTPException(status_code=500, detail=f"Could not parse AI JSON output. Raw: {text[:400]}")
         data = json.loads(m.group(0))
 
     cover_letter = data.get("cover_letter")
     if not isinstance(cover_letter, str) or not cover_letter.strip():
-        raise HTTPException(status_code=500, detail="OpenAI returned invalid cover letter output.")
+        raise HTTPException(status_code=500, detail="AI returned invalid cover letter output.")
     return cover_letter.strip()
 
 
 def _call_openai_outreach_preview(job_description: str, resume_text: str) -> Dict[str, object]:
-    if client is None:
-        raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set in backend/.env")
     if not resume_text.strip():
         raise HTTPException(status_code=400, detail="Resume text is empty; cannot generate outreach preview.")
 
@@ -1209,8 +1222,6 @@ def _call_openai_linkedin_queries(
     company: Optional[str],
     team: Optional[str],
 ) -> List[Dict[str, str]]:
-    if client is None:
-        raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set in backend/.env")
     instructions = (
         "You generate LinkedIn PEOPLE search queries for job outreach.\n"
         "\n"
@@ -1237,24 +1248,15 @@ def _call_openai_linkedin_queries(
         "company": company or "",
         "team": team or "",
     }
-    resp = client.chat.completions.create(
-        model=OPENAI_MODEL_CHEAP,
-        messages=[
-            {"role": "system", "content": instructions},
-            {"role": "user", "content": json.dumps(payload)},
-        ],
-        response_format={"type": "json_object"},
-        temperature=0.2,
-    )
-    text = (resp.choices[0].message.content or "").strip()
+    text = _call_ai_raw(instructions, json.dumps(payload), model_type="cheap", temperature=0.2)
     if not text:
-        raise HTTPException(status_code=500, detail="OpenAI returned empty output.")
+        raise HTTPException(status_code=500, detail="AI returned empty output.")
     try:
         data = json.loads(text)
     except Exception:
         m = re.search(r"\{.*\}", text, re.DOTALL)
         if not m:
-            raise HTTPException(status_code=500, detail=f"Could not parse OpenAI JSON output. Raw: {text[:400]}")
+            raise HTTPException(status_code=500, detail=f"Could not parse AI JSON output. Raw: {text[:400]}")
         data = json.loads(m.group(0))
 
     queries = data.get("queries")
@@ -1385,8 +1387,6 @@ def _call_openai_outreach_message(
     company: Optional[str],
     resume_text: str,
 ) -> str:
-    if client is None:
-        raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set in backend/.env")
     instructions = (
         "You write ONE concise LinkedIn outreach message.\n"
         "\n"
@@ -1409,35 +1409,24 @@ def _call_openai_outreach_message(
         "company": company or "",
         "resume_text": resume_text,
     }
-    resp = client.chat.completions.create(
-        model=OPENAI_MODEL_CHEAP,
-        messages=[
-            {"role": "system", "content": instructions},
-            {"role": "user", "content": json.dumps(payload)},
-        ],
-        response_format={"type": "json_object"},
-        temperature=0.2,
-    )
-    text = (resp.choices[0].message.content or "").strip()
+    text = _call_ai_raw(instructions, json.dumps(payload), model_type="cheap", temperature=0.2)
     if not text:
-        raise HTTPException(status_code=500, detail="OpenAI returned empty output.")
+        raise HTTPException(status_code=500, detail="AI returned empty output.")
     try:
         data = json.loads(text)
     except Exception:
         m = re.search(r"\{.*\}", text, re.DOTALL)
         if not m:
-            raise HTTPException(status_code=500, detail=f"Could not parse OpenAI JSON output. Raw: {text[:400]}")
+            raise HTTPException(status_code=500, detail=f"Could not parse AI JSON output. Raw: {text[:400]}")
         data = json.loads(m.group(0))
 
     message = data.get("outreach_message")
     if not isinstance(message, str) or not message.strip():
-        raise HTTPException(status_code=500, detail="OpenAI returned invalid outreach_message.")
+        raise HTTPException(status_code=500, detail="AI returned invalid outreach_message.")
     return message.strip()
 
 
 def _call_openai_full_resume_rewrite(job_description: str, resume_text: str) -> Dict[str, object]:
-    if client is None:
-        raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set in backend/.env")
     if not resume_text.strip():
         raise HTTPException(status_code=400, detail="Resume text is empty; cannot optimize.")
 
@@ -1471,40 +1460,30 @@ def _call_openai_full_resume_rewrite(job_description: str, resume_text: str) -> 
         f"{job_description}"
     )
 
-    resp = client.chat.completions.create(
-        model=OPENAI_MODEL_RESUME,
-        messages=[
-            {"role": "system", "content": instructions},
-            {"role": "user", "content": user_content},
-        ],
-        response_format={"type": "json_object"},
-        temperature=0.4,
-    )
-
-    text = (resp.choices[0].message.content or "").strip()
+    text = _call_ai_raw(instructions, user_content, model_type="resume", temperature=0.4)
     if not text:
-        raise HTTPException(status_code=500, detail="OpenAI returned empty output.")
+        raise HTTPException(status_code=500, detail="AI returned empty output.")
     try:
         data = json.loads(text)
     except Exception:
         m = re.search(r"\{.*\}", text, re.DOTALL)
         if not m:
-            raise HTTPException(status_code=500, detail=f"Could not parse OpenAI JSON output. Raw: {text[:400]}")
+            raise HTTPException(status_code=500, detail=f"Could not parse AI JSON output. Raw: {text[:400]}")
         data = json.loads(m.group(0))
 
     if not isinstance(data, dict):
-        raise HTTPException(status_code=500, detail="OpenAI returned invalid resume output.")
+        raise HTTPException(status_code=500, detail="AI returned invalid resume output.")
 
     experiences = data.get("experiences", [])
     projects = data.get("projects", [])
     skills = data.get("skills", "")
 
     if not isinstance(experiences, list):
-        raise HTTPException(status_code=500, detail="OpenAI returned invalid experiences list.")
+        raise HTTPException(status_code=500, detail="AI returned invalid experiences list.")
     if not isinstance(projects, list):
-        raise HTTPException(status_code=500, detail="OpenAI returned invalid projects list.")
+        raise HTTPException(status_code=500, detail="AI returned invalid projects list.")
     if not isinstance(skills, str):
-        raise HTTPException(status_code=500, detail="OpenAI returned invalid skills text.")
+        raise HTTPException(status_code=500, detail="AI returned invalid skills text.")
 
     return {
         "experiences": experiences,
@@ -1513,9 +1492,6 @@ def _call_openai_full_resume_rewrite(job_description: str, resume_text: str) -> 
     }
 
 def _call_openai_greeting(job_description: str) -> str:
-    if client is None:
-        raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set in backend/.env")
-
     instructions = (
         "You generate a single greeting line for a cover letter based on the job description.\n"
         "Return JSON ONLY: {\"greeting\":\"...\"}\n"
@@ -1524,16 +1500,10 @@ def _call_openai_greeting(job_description: str) -> str:
         "No extra text."
     )
     payload = {"job_description": job_description}
-    resp = client.chat.completions.create(
-        model=OPENAI_MODEL_CHEAP,
-        messages=[
-            {"role": "system", "content": instructions},
-            {"role": "user", "content": json.dumps(payload)},
-        ],
-        response_format={"type": "json_object"},
-        temperature=0.0,
-    )
-    text = (resp.choices[0].message.content or "").strip()
+    try:
+        text = _call_ai_raw(instructions, json.dumps(payload), model_type="cheap", temperature=0.0)
+    except Exception:
+        return "Dear Hiring Team,"
     if not text:
         return "Dear Hiring Team,"
     try:
@@ -1555,9 +1525,6 @@ def _call_openai(
     role_context: Optional[Dict[str, str]] = None,
     risk_level: str = "balanced",
 ) -> List[OptimizeResult]:
-    if client is None:
-        raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set in backend/.env")
-
     instructions = (
         "You are a resume bullet rewriting engine.\n"
         "Goal: tailor resume bullets to maximize interview selection for the job description.\n"
@@ -1586,20 +1553,9 @@ def _call_openai(
     if role_context:
         payload.update(role_context)
 
-    # Use Chat Completions API for broad compatibility with installed SDK versions.
-    resp = client.chat.completions.create(
-        model=OPENAI_MODEL_RESUME,
-        messages=[
-            {"role": "system", "content": instructions},
-            {"role": "user", "content": json.dumps(payload)},
-        ],
-        response_format={"type": "json_object"},
-        temperature=0.35,
-    )
-
-    text = (resp.choices[0].message.content or "").strip()
+    text = _call_ai_raw(instructions, json.dumps(payload), model_type="resume", temperature=0.35)
     if not text:
-        raise HTTPException(status_code=500, detail="OpenAI returned empty output.")
+        raise HTTPException(status_code=500, detail="AI returned empty output.")
 
     # Parse JSON robustly (sometimes models wrap with text; we forbid it, but be safe)
     try:
@@ -1608,11 +1564,11 @@ def _call_openai(
         # Try to extract first JSON object from text
         m = re.search(r"\{.*\}", text, re.DOTALL)
         if not m:
-            raise HTTPException(status_code=500, detail=f"Could not parse OpenAI JSON output. Raw: {text[:400]}")
+            raise HTTPException(status_code=500, detail=f"Could not parse AI JSON output. Raw: {text[:400]}")
         data = json.loads(m.group(0))
 
     if "results" not in data or not isinstance(data["results"], list):
-        raise HTTPException(status_code=500, detail=f"Unexpected OpenAI response schema. Raw: {text[:400]}")
+        raise HTTPException(status_code=500, detail=f"Unexpected AI response schema. Raw: {text[:400]}")
 
     results: List[OptimizeResult] = []
     by_id = {}
@@ -2355,3 +2311,21 @@ async def coverletter(
 def outreach_preview(req: OutreachPreviewRequest):
     preview = _call_openai_outreach_preview(req.job_description, req.resume_text)
     return preview
+
+
+class AiProviderRequest(BaseModel):
+    provider: str
+
+
+@app.get("/settings/ai-provider")
+def get_ai_provider():
+    return {"provider": current_ai_provider}
+
+
+@app.post("/settings/ai-provider")
+def set_ai_provider(req: AiProviderRequest):
+    global current_ai_provider
+    if req.provider not in ("openai", "anthropic"):
+        raise HTTPException(status_code=400, detail="provider must be 'openai' or 'anthropic'")
+    current_ai_provider = req.provider
+    return {"provider": current_ai_provider}

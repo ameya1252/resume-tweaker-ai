@@ -217,6 +217,9 @@ export default function App() {
   const previewRef = useRef<HTMLDivElement | null>(null)
   const outreachKeyRef = useRef<string>('')
 
+  const [aiProvider, setAiProvider] = useState<'openai' | 'anthropic'>('openai')
+  const [aiProviderLoading, setAiProviderLoading] = useState(false)
+
   const isAuthenticated = !!sessionToken
   const userInitial = (userEmail.trim()[0] || 'U').toUpperCase()
 
@@ -227,6 +230,25 @@ export default function App() {
       delete axios.defaults.headers.common.Authorization
     }
   }, [sessionToken])
+
+  useEffect(() => {
+    axios.get(`${BACKEND_URL}/settings/ai-provider`)
+      .then((res) => setAiProvider(res.data.provider === 'anthropic' ? 'anthropic' : 'openai'))
+      .catch(() => {})
+  }, [])
+
+  async function handleToggleAiProvider() {
+    const next = aiProvider === 'openai' ? 'anthropic' : 'openai'
+    setAiProviderLoading(true)
+    try {
+      const res = await axios.post(`${BACKEND_URL}/settings/ai-provider`, { provider: next })
+      setAiProvider(res.data.provider)
+    } catch {
+      // silently ignore
+    } finally {
+      setAiProviderLoading(false)
+    }
+  }
 
   useEffect(() => {
     const handlePop = () => setRoutePath(window.location.pathname)
@@ -900,6 +922,14 @@ export default function App() {
                   <button className="chip tiny" onClick={handleOpenSaved}>
                     Saved Resumes
                   </button>
+                  <button
+                    className={`chip tiny ${aiProvider === 'anthropic' ? 'active' : ''}`}
+                    onClick={handleToggleAiProvider}
+                    disabled={aiProviderLoading}
+                    title={`Switch to ${aiProvider === 'openai' ? 'Claude (Anthropic)' : 'GPT (OpenAI)'}`}
+                  >
+                    {aiProvider === 'openai' ? 'GPT' : 'Claude'}
+                  </button>
                   <div className="user-chip">
                     <div className="avatar">{userInitial}</div>
                     <div className="user-email">{userEmail || 'Account'}</div>
@@ -1087,6 +1117,14 @@ export default function App() {
           <div className="user-menu">
             <button className="chip tiny" onClick={handleOpenSaved}>
               Saved Resumes
+            </button>
+            <button
+              className={`chip tiny ai-provider-toggle ${aiProvider === 'anthropic' ? 'active' : ''}`}
+              onClick={handleToggleAiProvider}
+              disabled={aiProviderLoading}
+              title={`Switch to ${aiProvider === 'openai' ? 'Claude (Anthropic)' : 'GPT (OpenAI)'}`}
+            >
+              {aiProvider === 'openai' ? 'GPT' : 'Claude'}
             </button>
             <div className="user-chip">
               <div className="avatar">{userInitial}</div>
