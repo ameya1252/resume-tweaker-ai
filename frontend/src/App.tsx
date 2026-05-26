@@ -561,8 +561,8 @@ export default function App() {
     if (mode === 'docx') {
       return jobDescription.trim().length > 40 && !!docxFile
     }
-    return jobDescription.trim().length > 40 && hasTemplate
-  }, [jobDescription, mode, selectedDocId, hasTemplate, docxFile])
+    return jobDescription.trim().length > 40 && (hasTemplate || !!latexFile || !!latexText.trim())
+  }, [jobDescription, mode, selectedDocId, hasTemplate, docxFile, latexFile, latexText])
 
   const canGenerateCover = useMemo(() => {
     if (mode === 'gdocs') {
